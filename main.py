@@ -12,30 +12,44 @@ API_HASH = os.getenv("API_HASH", "")
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 CHANNEL_ID = int(os.getenv("CHANNEL_ID", 0)) 
 INVITE_LINK = "https://t.me/+eooytvOAwjc0NTI1"
+CONTACT_URL = "https://t.me/poocha"
 DOWNLOAD_DIR = "downloads"
 DAILY_LIMIT = 15 * 1024 * 1024 * 1024 
-COOKIES_FILE = "cookies.txt" 
+COOKIES_FILE = "cookies.txt"
 
-# Rotating Messages
-USER_GREETINGS = ["Thanks for chatting with me.", "Glad you’re here.", "Appreciate you using this bot.", "Happy to help you today.", "Let me know how I can assist."]
-ADMIN_GREETINGS = ["Chief, systems are ready.", "Ready when you are, chief.", "All set. What’s the move?", "Standing by for instructions.", "Let’s begin, chief."]
+# --- ROTATING MESSAGES ---
+USER_GREETINGS = [
+    "Thanks for chatting with me.", "Glad you’re here.", 
+    "Appreciate you using this bot.", "Happy to help you today.", 
+    "Let me know how I can assist."
+]
+ADMIN_GREETINGS = [
+    "Chief, systems are ready.", "Ready when you are, chief.", 
+    "All set. What’s the move?", "Standing by for instructions.", 
+    "Let’s begin, chief."
+]
 
+# --- DB & STATE ---
 DB = {"users": {}, "active": {}, "banned": set()}
 CANCEL_GROUPS = set()
 
-# Added sleep_threshold to handle FloodWaits automatically
 app = Client("dl_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN, sleep_threshold=120)
 
+# --- WEB SERVER (Koyeb Health) ---
 async def health_check(request):
     return web.Response(text="Bot Alive")
 
+# --- UTILS ---
 def get_user(uid):
     today = datetime.now().date()
-    if uid not in DB["users"]: DB["users"][uid] = {"used": 0, "last_reset": today}
-    if DB["users"][uid]["last_reset"] != today: DB["users"][uid].update({"used": 0, "last_reset": today})
+    if uid not in DB["users"]:
+        DB["users"][uid] = {"used": 0, "last_reset": today}
+    if DB["users"][uid]["last_reset"] != today:
+        DB["users"][uid].update({"used": 0, "last_reset": today})
     return DB["users"][uid]
 
 def format_size(size):
+    if not size: return "0B"
     for unit in ['B', 'KB', 'MB', 'GB']:
         if size < 1024: return f"{size:.2f}{unit}"
         size /= 1024
@@ -48,23 +62,41 @@ async def is_subscribed(uid):
         return member.status in [enums.ChatMemberStatus.MEMBER, enums.ChatMemberStatus.ADMINISTRATOR, enums.ChatMemberStatus.OWNER]
     except: return False
 
-# --- PROGRESS HOOK (Safety: 10s delay) ---
 async def progress_hook(current, total, msg, start_time, action):
     if msg.chat.id in CANCEL_GROUPS: raise Exception("USER_CANCEL")
     now = time.time()
-    
-    # Store last update time in the message object to be safe
     if not hasattr(msg, "last_up"): msg.last_up = 0
     if (now - msg.last_up) < 10: return 
-    
     msg.last_up = now
     try:
         p = current * 100 / total
         bar = "✅" * int(p/10) + "⬜" * (10 - int(p/10))
         await msg.edit(f"⏳ {action}...\n`{bar}` {p:.1f}%\n📦 {format_size(current)} / {format_size(total)}")
-    except errors.FloodWait as e:
-        await asyncio.sleep(e.value)
     except: pass
+
+async def take_screenshots(video_path, uid):
+    output_dir = os.path.join(DOWNLOAD_DIR, f"screens_{uid}")
+    if not os.path.exists(output_dir): os.makedirs(output_dir)
+    try:
+        cmd = f'ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "{video_path}"'
+        duration = float(subprocess.check_output(cmd, shell=True))
+        screens = []
+        for i in range(1, 11):
+            time_pos = (duration / 11) * i
+            out_path = os.path.join(output_dir, f"thumb_{i}.jpg")
+            subprocess.call(['ffmpeg', '-ss', str(time_pos), '-i', video_path, '-vframes', '1', '-q:v', '2', out_path, '-y'], stderr=subprocess.DEVNULL)
+            if os.path.exists(out_path): screens.append(types.InputMediaPhoto(out_path))
+        return screens
+    except: return []
+
+# --- KEYBOARDS ---
+def get_admin_main():
+    return types.InlineKeyboardMarkup([
+        [types.InlineKeyboardButton("📊 Reports", callback_data="adm_reports"),
+         types.InlineKeyboardButton("💾 Disk Usage", callback_data="adm_disk")],
+        [types.InlineKeyboardButton("⌨️ Commands", callback_data="adm_cmds"),
+         types.InlineKeyboardButton("📢 Broadcast", callback_data="adm_bc")]
+    ])
 
 def get_ready_btns():
     return types.InlineKeyboardMarkup([
@@ -74,19 +106,48 @@ def get_ready_btns():
          types.InlineKeyboardButton("Cancel ❌", callback_data="cancel")]
     ])
 
+# --- COMMANDS ---
 @app.on_message(filters.command("start"))
 async def start_cmd(_, m):
     uid = m.from_user.id
-    msg = random.choice(ADMIN_GREETINGS if uid == OWNER_ID else USER_GREETINGS)
-    await m.reply(msg)
+    if uid == OWNER_ID:
+        await m.reply(random.choice(ADMIN_GREETINGS), reply_markup=get_admin_main())
+    else:
+        btn = types.InlineKeyboardMarkup([[types.InlineKeyboardButton("💖 Donate / Contact", url=CONTACT_URL)]])
+        await m.reply(random.choice(USER_GREETINGS), reply_markup=btn)
 
 @app.on_message(filters.command("status"))
 async def status_cmd(_, m):
     uid = m.from_user.id
     user = get_user(uid)
     limit = "Unlimited" if uid == OWNER_ID else "15.00GB"
-    await m.reply(f"📊 **Usage:** `{format_size(user['used'])}` / `{limit}`")
+    await m.reply(f"📊 **Memory Usage**\n\nUsed Today: `{format_size(user['used'])}` / `{limit}`\n\nTo upgrade, contact @poocha")
 
+@app.on_message(filters.command("admin") & filters.user(OWNER_ID))
+async def admin_cmd(_, m):
+    await m.reply("🛠 **Admin Control Center**", reply_markup=get_admin_main())
+
+@app.on_message(filters.command("ban") & filters.user(OWNER_ID))
+async def ban_handler(_, m):
+    try:
+        target = int(m.command[1])
+        DB["banned"].add(target)
+        await m.reply(f"🚫 User `{target}` banned.")
+    except: await m.reply("Use: `/ban ID`")
+
+@app.on_message(filters.command("broadcast") & filters.user(OWNER_ID))
+async def bc_handler(_, m):
+    if len(m.command) < 2: return
+    text = m.text.split(None, 1)[1]
+    count = 0
+    for u in DB["users"]:
+        try:
+            await app.send_message(u, f"📢 **Announcement**\n\n{text}")
+            count += 1
+        except: pass
+    await m.reply(f"✅ Sent to {count} users.")
+
+# --- MAIN LOGIC ---
 @app.on_message(filters.text)
 async def handle_text(client, m):
     uid = m.from_user.id
@@ -104,14 +165,15 @@ async def handle_text(client, m):
 
     if m.text.startswith("http"):
         if not await is_subscribed(uid):
-            return await m.reply("⚠️ Join channel to download!", reply_markup=types.InlineKeyboardMarkup([[types.InlineKeyboardButton("Join", url=INVITE_LINK)]]))
+            btn = types.InlineKeyboardMarkup([[types.InlineKeyboardButton("Join Channel", url=INVITE_LINK)]])
+            return await m.reply("⚠️ You must join the channel to use this bot.", reply_markup=btn)
         
         if uid != OWNER_ID and user["used"] >= DAILY_LIMIT:
-            return await m.reply("❌ Limit reached.")
+            btn = types.InlineKeyboardMarkup([[types.InlineKeyboardButton("💖 Upgrade / Donate", url=CONTACT_URL)]])
+            return await m.reply("❌ Daily 15GB limit reached.", reply_markup=btn)
 
         CANCEL_GROUPS.discard(uid)
         status_msg = await m.reply("🔍 Analyzing...")
-        
         ydl_opts = {'quiet': True, 'extractor_args': {'youtube': {'player_client': ['ios', 'android']}}}
         if os.path.exists(COOKIES_FILE): ydl_opts['cookiefile'] = COOKIES_FILE
 
@@ -121,76 +183,38 @@ async def handle_text(client, m):
                 size = info.get('filesize') or info.get('filesize_approx') or 0
                 DB["active"][uid] = {"url": m.text, "time": time.time(), "name": info.get('title', 'file'), "size": size}
                 
+                if uid != OWNER_ID:
+                    await app.send_message(OWNER_ID, f"👁️ **New Download:**\nUID: `{uid}`\nFile: `{info.get('title')}`\nSize: {format_size(size)}")
+
                 btns = [[types.InlineKeyboardButton(f"Video ({format_size(size)})", callback_data="dl_vid")],
-                        [types.InlineKeyboardButton("Audio (MP3)", callback_data="dl_aud")]]
+                        [types.InlineKeyboardButton("Audio (MP3)", callback_data="dl_aud")],
+                        [types.InlineKeyboardButton("Cancel", callback_data="cancel")]]
                 await status_msg.edit("Choose format:", reply_markup=types.InlineKeyboardMarkup(btns))
-        except Exception as e: await status_msg.edit(f"❌ Error: Link is blocked or invalid.")
+        except Exception as e: await status_msg.edit(f"❌ Error: {str(e)[:50]}")
 
 @app.on_callback_query()
 async def cb_handler(client, cb: types.CallbackQuery):
     uid = cb.from_user.id
-    if cb.data == "cancel":
+    data = cb.data
+
+    if data.startswith("adm_") and uid == OWNER_ID:
+        if data == "adm_reports":
+            t, u, f = shutil.disk_usage("/")
+            await cb.message.edit(f"📊 **Reports**\n\nTotal Users: {len(DB['users'])}\nDisk: {format_size(u)}/{format_size(t)}", reply_markup=get_admin_main())
+        elif data == "adm_disk":
+            await cb.answer(f"Free Space: {format_size(shutil.disk_usage('/').free)}", show_alert=True)
+        elif data == "adm_cmds":
+            await cb.message.edit("⌨️ `/ban ID`\n`/broadcast TEXT`\n`/status`", reply_markup=get_admin_main())
+        return
+
+    if data == "cancel":
         CANCEL_GROUPS.add(uid)
         DB["active"].pop(uid, None)
-        return await cb.message.edit("❌ Cancelled.")
+        return await cb.message.edit("❌ Session Cancelled.")
 
     if uid not in DB["active"]: return await cb.answer("Expired.")
     state = DB["active"][uid]
 
-    if cb.data.startswith("dl_"):
+    if data.startswith("dl_"):
         await cb.message.edit("⏳ Downloading...")
-        is_vid = cb.data == "dl_vid"
-        ydl_opts = {
-            'format': 'bestvideo+bestaudio/best' if is_vid else 'bestaudio/best',
-            'outtmpl': f'{DOWNLOAD_DIR}/%(title)s.%(ext)s',
-            'postprocessors': [{'key': 'FFmpegExtractAudio','preferredcodec': 'mp3'}] if not is_vid else [],
-            'extractor_args': {'youtube': {'player_client': ['ios', 'android']}}, 'quiet': True
-        }
-        if os.path.exists(COOKIES_FILE): ydl_opts['cookiefile'] = COOKIES_FILE
-
-        try:
-            with YoutubeDL(ydl_opts) as ydl:
-                info = ydl.extract_info(state["url"], download=True)
-                path = ydl.prepare_filename(info)
-                if not is_vid: path = os.path.splitext(path)[0] + ".mp3"
-                DB["active"][uid].update({"path": path, "name": os.path.basename(path), "status": "ready"})
-                await cb.message.edit(f"✅ Ready.", reply_markup=get_ready_btns())
-        except Exception as e: await cb.message.edit(f"❌ Error during download.")
-
-    elif cb.data.startswith("up_"):
-        await cb.message.edit("📤 Uploading...")
-        path = state["path"]
-        try:
-            if path.lower().endswith(('.mp4', '.mkv', '.mov')):
-                await client.send_video(uid, video=path, caption=f"`{state['name']}`", 
-                                        progress=progress_hook, progress_args=(cb.message, time.time(), "Uploading Video"))
-            else:
-                await client.send_document(uid, document=path, caption=f"`{state['name']}`",
-                                         progress=progress_hook, progress_args=(cb.message, time.time(), "Uploading File"))
-            
-            if uid != OWNER_ID: get_user(uid)["used"] += state["size"]
-            await cb.message.delete()
-        except Exception as e:
-            if "USER_CANCEL" not in str(e): await cb.message.reply(f"❌ Upload Error.")
-        finally:
-            if os.path.exists(path): os.remove(path)
-            DB["active"].pop(uid, None)
-
-    elif cb.data == "rename":
-        DB["active"][uid]["status"] = "renaming"
-        await cb.message.edit("📝 Send new name:")
-
-async def main():
-    if not os.path.exists(DOWNLOAD_DIR): os.makedirs(DOWNLOAD_DIR)
-    await app.start()
-    scheduler = AsyncIOScheduler()
-    scheduler.add_job(lambda: DB["active"].clear(), "interval", hours=1)
-    scheduler.start()
-    
-    server = web.Application(); server.add_routes([web.get('/', health_check)])
-    runner = web.AppRunner(server); await runner.setup()
-    await web.TCPSite(runner, '0.0.0.0', 8000).start()
-    await idle()
-
-if __name__ == "__main__":
-    app.run(main())
+        is_vid 
