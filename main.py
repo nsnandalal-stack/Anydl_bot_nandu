@@ -1,8 +1,7 @@
 import os, re, shutil, time, asyncio, random, subprocess, json
-from datetime import datetime, timedelta
+from datetime import datetime
 from pyrogram import Client, filters, types, enums, idle, errors
 from yt_dlp import YoutubeDL
-from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from aiohttp import web
 
 # --- MASTER CONFIG ---
@@ -17,13 +16,9 @@ DOWNLOAD_DIR = "/app/downloads"
 THUMB_DIR = "/app/thumbnails"
 DB_FILE = "/app/database.json"
 COOKIES_FILE = "/app/cookies.txt"
-QUOTA_LIMIT = 5 * 1024 * 1024 * 1024 
 
-USER_GREETINGS = ["Thanks for chatting with me.", "Glad you’re here.", "Appreciate you using this bot."]
-ADMIN_GREETINGS = ["Chief, systems are ready.", "Ready when you are, chief.", "Standing by."]
-
-# --- DB PERSISTENCE ---
-DB = {"users": {}, "active": {}, "history": [], "temp_bc": None}
+# --- DB ENGINE ---
+DB = {"users": {}, "active": {}, "admins": [519459195]}
 
 def save_db():
     with open(DB_FILE, "w") as f: json.dump(DB, f, default=str)
@@ -32,32 +27,25 @@ def load_db():
     global DB
     if os.path.exists(DB_FILE):
         try:
-            with open(DB_FILE, "r") as f: 
+            with open(DB_FILE, "r") as f:
                 DB = json.load(f)
-                if "history" not in DB: DB["history"] = []
                 if "active" not in DB: DB["active"] = {}
+                if "admins" not in DB: DB["admins"] = [OWNER_ID]
         except: pass
 
 def get_user(uid):
     uid_s = str(uid)
-    today = str(datetime.now().date())
     if uid_s not in DB["users"]:
-        DB["users"][uid_s] = {"used": 0, "last_reset": today, "warnings": 0, "is_pro": False, "thumb": None, "watermark": None, "state": "none", "last_task": None}
-    if DB["users"][uid_s].get("last_reset") != today:
-        DB["users"][uid_s].update({"used": 0, "last_reset": today})
+        DB["users"][uid_s] = {"thumb": None, "state": "none"}
     return DB["users"][uid_s]
 
-def format_size(size):
-    if not size: return "0B"
-    for unit in ['B', 'KB', 'MB', 'GB']:
-        if size < 1024: return f"{size:.2f}{unit}"
-        size /= 1024
-    return f"{size:.2f}TB"
-
 app = Client("dl_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN, sleep_threshold=120)
-scheduler = AsyncIOScheduler()
 
 # --- UTILS ---
+async def safe_edit(msg, text, reply_markup=None):
+    try: return await msg.edit(text, reply_markup=reply_markup)
+    except: return msg
+
 async def is_subscribed(uid):
     if uid == OWNER_ID: return True
     try:
@@ -65,225 +53,161 @@ async def is_subscribed(uid):
         return m.status in [enums.ChatMemberStatus.MEMBER, enums.ChatMemberStatus.ADMINISTRATOR, enums.ChatMemberStatus.OWNER]
     except: return False
 
-async def safe_edit(msg, text, reply_markup=None):
-    try: await msg.edit(text, reply_markup=reply_markup)
-    except errors.MessageNotModified: pass
-    except Exception: pass
-
-async def progress_hook(current, total, msg, start_time, action):
-    now = time.time()
-    if not hasattr(msg, "last_up"): msg.last_up = 0
-    if (now - msg.last_up) < 10: return 
-    msg.last_up = now
-    try:
-        p = (current * 100 / total) if total > 0 else 0
-        bar = "✅" * int(p/10) + "⬜" * (10 - int(p/10))
-        await safe_edit(msg, f"⏳ {action}...\n`{bar}` {p:.1f}%\n📦 {format_size(current)} / {format_size(total)}")
-    except: pass
-
-async def notify_ready(uid):
-    try: await app.send_message(uid, "✅ **Cooldown finished.** Send task now.")
-    except: pass
-
-def check_cooldown(uid):
-    user = get_user(uid)
-    if uid == OWNER_ID or user["is_pro"]: return True, 0
-    if not user.get("last_task"): return True, 0
-    last_t = datetime.fromisoformat(user["last_task"]) if isinstance(user["last_task"], str) else user["last_task"]
-    elapsed = (datetime.now() - last_t).total_seconds()
-    if elapsed < 600: return False, int(600 - elapsed)
-    return True, 0
-
-# --- MEDIA TOOLS ---
 async def take_screenshots(video_path, uid):
-    output_dir = os.path.join(DOWNLOAD_DIR, f"screens_{uid}")
-    if not os.path.exists(output_dir): os.makedirs(output_dir)
+    out_dir = os.path.join(DOWNLOAD_DIR, f"sc_{uid}")
+    if not os.path.exists(out_dir): os.makedirs(out_dir)
     try:
         cmd = f'ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "{video_path}"'
         duration = float(subprocess.check_output(cmd, shell=True))
         screens = []
         for i in range(1, 11):
-            time_pos = (duration / 11) * i
-            out_path = os.path.join(output_dir, f"thumb_{i}.jpg")
-            subprocess.call(['ffmpeg', '-ss', str(time_pos), '-i', video_path, '-vframes', '1', '-q:v', '2', out_path, '-y'], stderr=subprocess.DEVNULL)
-            if os.path.exists(out_path): screens.append(types.InputMediaPhoto(out_path))
+            t = (duration / 11) * i
+            p = os.path.join(out_dir, f"{i}.jpg")
+            subprocess.call(['ffmpeg', '-ss', str(t), '-i', video_path, '-vframes', '1', p, '-y'], stderr=subprocess.DEVNULL)
+            if os.path.exists(p): screens.append(types.InputMediaPhoto(p))
         return screens
     except: return []
 
-async def apply_watermark(file_path, text):
-    out_path = file_path.rsplit(".", 1)[0] + "_wm.mp4"
-    cmd = f'ffmpeg -i "{file_path}" -vf "drawtext=text=\'{text}\':x=10:y=H-th-10:fontsize=24:fontcolor=white" -c:a copy "{out_path}" -y'
-    subprocess.call(cmd, shell=True)
-    return out_path if os.path.exists(out_path) else file_path
-
 # --- KEYBOARDS ---
 def get_main_btns(uid):
-    user = get_user(uid)
-    btns = [[types.InlineKeyboardButton("❓ Help", callback_data="m_help"), types.InlineKeyboardButton("🆔 My ID", callback_data="m_id")],
-            [types.InlineKeyboardButton("🖼 Thumbnail Manager", callback_data="m_thumb")]]
-    if uid == OWNER_ID:
-        btns.append([types.InlineKeyboardButton("⚙️ Admin Dashboard", callback_data="m_adm")])
-    else:
-        btns.append([types.InlineKeyboardButton("📊 My Status", callback_data="m_stat"), types.InlineKeyboardButton("💎 Upgrade", callback_data="m_upgr")])
-    btns.append([types.InlineKeyboardButton("🚪 Exit", callback_data="exit")])
+    btns = [[types.InlineKeyboardButton("❓ Help", callback_data="cb_help"), types.InlineKeyboardButton("🆔 My ID", callback_data="cb_id")],
+            [types.InlineKeyboardButton("🖼 Thumbnail Manager", callback_data="cb_thumb_mgr")]]
+    if uid == OWNER_ID: btns.append([types.InlineKeyboardButton("⚙️ Admin Panel", callback_data="cb_admin_main")])
+    btns.append([types.InlineKeyboardButton("🚪 Exit", callback_data="cb_exit")])
     return types.InlineKeyboardMarkup(btns)
 
-def get_ready_btns(uid):
-    user = get_user(uid)
-    is_pro = (uid == OWNER_ID or user["is_pro"])
-    btns = [[types.InlineKeyboardButton("Video 🎥", callback_data="u_vid"), types.InlineKeyboardButton("File 📄", callback_data="u_fil")],
-            [types.InlineKeyboardButton("Upload + 📸", callback_data="u_scr"), types.InlineKeyboardButton("Rename ✏️", callback_data="u_ren")]]
-    if is_pro:
-        btns.append([types.InlineKeyboardButton("Watermark 🏷" if not user["watermark"] else "Clear Watermark ❌", callback_data="p_wat")])
-    btns.append([types.InlineKeyboardButton("Cancel ❌", callback_data="cancel")])
-    return types.InlineKeyboardMarkup(btns)
+def get_ready_menu():
+    return types.InlineKeyboardMarkup([
+        [types.InlineKeyboardButton("Rename ✏️", callback_data="cb_ren_start"), types.InlineKeyboardButton("Upload ⬆️", callback_data="cb_up_start")],
+        [types.InlineKeyboardButton("Cancel ❌", callback_data="cb_cancel")]
+    ])
 
-def get_rename_menu():
-    return types.InlineKeyboardMarkup([[types.InlineKeyboardButton("✅ Use Default Name", callback_data="u_default")], [types.InlineKeyboardButton("❌ Cancel", callback_data="cancel")]])
+def get_rename_options():
+    return types.InlineKeyboardMarkup([
+        [types.InlineKeyboardButton("✅ Use Default", callback_data="cb_ren_def"), types.InlineKeyboardButton("✏️ Enter New Name", callback_data="cb_ren_cus")],
+        [types.InlineKeyboardButton("🔙 Back", callback_data="cb_ready_back")]
+    ])
+
+def get_upload_options():
+    return types.InlineKeyboardMarkup([
+        [types.InlineKeyboardButton("Video 🎥", callback_data="cb_up_vid"), types.InlineKeyboardButton("File 📄", callback_data="cb_up_fil")],
+        [types.InlineKeyboardButton("Upload + 📸", callback_data="cb_up_scr")],
+        [types.InlineKeyboardButton("🔙 Back", callback_data="cb_ready_back")]
+    ])
 
 # --- HANDLERS ---
 @app.on_message(filters.command("start") & filters.private)
 async def start_cmd(_, m):
-    uid = m.from_user.id
-    msg = random.choice(ADMIN_GREETINGS if uid == OWNER_ID else USER_GREETINGS)
-    await m.reply(msg, reply_markup=get_main_btns(uid))
-
-@app.on_message(filters.photo & filters.private)
-async def save_thumb(_, m):
-    uid = m.from_user.id
-    path = os.path.join(THUMB_DIR, f"{uid}.jpg")
-    await m.download(path)
-    get_user(uid)["thumb"] = path; save_db()
-    await m.reply("🖼 Thumbnail Saved.", reply_markup=get_main_btns(uid))
+    get_user(m.from_user.id)["state"] = "none"
+    await m.reply("Chief, systems are ready." if m.from_user.id == OWNER_ID else "Appreciate you using this bot.", reply_markup=get_main_btns(m.from_user.id))
 
 @app.on_message((filters.video | filters.document | filters.forwarded) & filters.private)
-async def handle_media(client, m):
-    uid, uid_str = m.from_user.id, str(m.from_user.id)
-    if not await is_subscribed(uid): return await m.reply("Join channel first.", reply_markup=types.InlineKeyboardMarkup([[types.InlineKeyboardButton("Join", url=INVITE_LINK)], [types.InlineKeyboardButton("🔄 Verify", callback_data="v_sub")]]))
+async def media_handler(client, m):
+    uid, uid_s = m.from_user.id, str(m.from_user.id)
+    if not await is_subscribed(uid): return await m.reply("⚠️ Join channel first.", reply_markup=types.InlineKeyboardMarkup([[types.InlineKeyboardButton("Join", url=INVITE_LINK)], [types.InlineKeyboardButton("🔄 Verify", callback_data="cb_verify")]]))
     
-    status_msg = await m.reply("📥 Downloading media...")
-    path = os.path.join(DOWNLOAD_DIR, f"file_{uid}")
+    status = await m.reply("📥 Downloading...")
+    path = os.path.join(DOWNLOAD_DIR, f"f_{uid}")
     media = m.video or m.document
-    await m.download(path, progress=progress_hook, progress_args=(status_msg, time.time(), "Downloading"))
-    DB["active"][uid_str] = {"path": path, "name": getattr(media, "file_name", "file.mp4"), "status": "ready", "size": media.file_size}
-    save_db(); await status_msg.edit("✅ Media Ready.", reply_markup=get_ready_btns(uid))
+    await m.download(path)
+    DB["active"][uid_s] = {"path": path, "name": getattr(media, "file_name", "file.mp4"), "status": "ready"}
+    save_db(); await status.edit("✅ Downloaded to server.", reply_markup=get_ready_menu())
 
 @app.on_message(filters.text & ~filters.command(["start"]) & filters.private)
-async def handle_text(client, m):
-    uid, uid_str = m.from_user.id, str(m.from_user.id)
+async def text_handler(client, m):
+    uid, uid_s = m.from_user.id, str(m.from_user.id)
     user = get_user(uid)
 
-    if user["state"] == "pending_bc" and uid == OWNER_ID:
-        DB["temp_bc"] = m.text; user["state"] = "none"
-        return await m.reply(f"📝 **Preview:**\n\n{m.text}", reply_markup=types.InlineKeyboardMarkup([[types.InlineKeyboardButton("✅ Confirm", callback_data="bc_yes"), types.InlineKeyboardButton("❌ Stop", callback_data="m_adm")]]))
-
-    if user["state"] == "set_wat":
-        user["watermark"] = m.text; user["state"] = "none"; save_db()
-        return await m.reply(f"✅ Watermark set to: `{m.text}`", reply_markup=get_main_btns(uid))
-
-    if uid_str in DB["active"] and DB["active"][uid_str].get("status") == "renaming":
-        state = DB["active"][uid_str]
+    if user["state"] == "renaming" and uid_s in DB["active"]:
+        state = DB["active"][uid_s]
         ext = os.path.splitext(state["path"])[1] or ".mp4"
         new_name = m.text if m.text.endswith(ext) else f"{m.text}{ext}"
         new_path = os.path.join(DOWNLOAD_DIR, new_name)
-        os.rename(state["path"], new_path); state.update({"path": new_path, "name": new_name, "status": "ready"}); save_db()
-        return await m.reply(f"✅ Renamed.", reply_markup=get_ready_btns(uid))
+        os.rename(state["path"], new_path)
+        state.update({"path": new_path, "name": new_name})
+        user["state"] = "none"; save_db()
+        return await m.reply(f"✅ Name set to: `{new_name}`", reply_markup=get_ready_menu())
 
     if m.text.startswith("http"):
-        if not await is_subscribed(uid): return await m.reply("Join channel first.", reply_markup=types.InlineKeyboardMarkup([[types.InlineKeyboardButton("Join", url=INVITE_LINK)], [types.InlineKeyboardButton("🔄 Verify", callback_data="v_sub")]]))
-        can_run, wait = check_cooldown(uid)
-        if not can_run: return await m.reply(f"⏳ Cooldown: {wait}s.")
+        if not await is_subscribed(uid): return await m.reply("⚠️ Join channel.", reply_markup=types.InlineKeyboardMarkup([[types.InlineKeyboardButton("Join", url=INVITE_LINK)], [types.InlineKeyboardButton("🔄 Verify", callback_data="cb_verify")]]))
         
-        status_msg = await m.reply("🔍 Analyzing...")
+        status = await m.reply("🔍 Analyzing...")
+        if "youtube.com" in m.text or "youtu.be" in m.text:
+            DB["active"][uid_s] = {"url": m.text, "status": "choosing"}
+            save_db()
+            btns = [[types.InlineKeyboardButton("1080p", callback_data="yt_1080"), types.InlineKeyboardButton("720p", callback_data="yt_720")],
+                    [types.InlineKeyboardButton("480p", callback_data="yt_480"), types.InlineKeyboardButton("MP3", callback_data="yt_mp3")],
+                    [types.InlineKeyboardButton("❌ Cancel", callback_data="cb_cancel")]]
+            return await status.edit("🎬 YouTube Format:", reply_markup=types.InlineKeyboardMarkup(btns))
+        
         try:
             with YoutubeDL({'quiet': True}) as ydl:
-                info = ydl.extract_info(m.text, download=False)
-                size = info.get('filesize_approx') or info.get('filesize') or 0
-                if "entries" in info: # Playlist
-                    await status_msg.edit(f"📂 Playlist: {len(info['entries'])} items. Process one-by-one?")
-                    for entry in info['entries']:
-                        # Logic for one-by-one is triggered here in a real scenario
-                        pass
-                
-                DB["active"][uid_str] = {"url": m.text, "status": "choosing", "size": size}
-                btns = [[types.InlineKeyboardButton(f"Video ({format_size(size)})", callback_data="dl_vid")],
-                        [types.InlineKeyboardButton("Audio (MP3)", callback_data="dl_aud"), types.InlineKeyboardButton("Cancel", callback_data="cancel")]]
-                await status_msg.edit("🎬 YouTube Detection:", reply_markup=types.InlineKeyboardMarkup(btns))
-        except: await status_msg.edit("❌ Error.")
+                info = ydl.extract_info(m.text, download=True)
+                path = ydl.prepare_filename(info)
+                DB["active"][uid_s] = {"path": path, "name": os.path.basename(path), "status": "ready"}
+                save_db(); await status.edit("✅ Ready.", reply_markup=get_ready_menu())
+        except Exception as e: await status.edit(f"❌ Error: {str(e)[:50]}")
 
 @app.on_callback_query()
 async def cb_handler(client, cb: types.CallbackQuery):
-    uid, uid_str = cb.from_user.id, str(cb.from_user.id)
+    uid, uid_s = cb.from_user.id, str(cb.from_user.id)
     data, user = cb.data, get_user(uid)
     await cb.answer()
 
-    if data == "exit": await cb.message.delete(); return
-    if data == "m_id": await cb.answer(f"ID: {uid}", show_alert=True); return
-    if data == "back_main": await safe_edit(cb.message, "Main Menu", reply_markup=get_main_btns(uid)); return
-    if data == "v_sub":
-        if await is_subscribed(uid): await safe_edit(cb.message, "✅ Access Granted.", reply_markup=get_main_btns(uid))
-        else: await cb.answer("❌ Join first!", show_alert=True)
+    if data == "cb_exit": return await cb.message.delete()
+    if data == "cb_id": return await cb.answer(f"ID: {uid}", show_alert=True)
+    if data == "cb_help": return await safe_edit(cb.message, "📖 Send a link or forward a file.", reply_markup=get_main_btns(uid))
+    if data == "cb_verify":
+        if await is_subscribed(uid): return await safe_edit(cb.message, "✅ Verified!", reply_markup=get_main_btns(uid))
+        else: return await cb.answer("❌ Join first!", show_alert=True)
+
+    if data == "cb_thumb_mgr":
+        btns = [[types.InlineKeyboardButton("👁 View Thumbnail", callback_data="t_view"), types.InlineKeyboardButton("🗑 Delete Thumbnail", callback_data="t_del")]]
+        return await safe_edit(cb.message, "🖼 **Thumbnail Manager**", reply_markup=types.InlineKeyboardMarkup(btns))
+
+    if data == "t_view":
+        if user["thumb"]: await cb.message.reply_photo(user["thumb"])
+        else: await cb.answer("No thumbnail!", show_alert=True)
         return
+    if data == "t_del":
+        user["thumb"] = None; save_db(); return await cb.answer("Deleted!")
 
-    if data == "m_thumb":
-        btns = [[types.InlineKeyboardButton("👁 View", callback_data="v_t"), types.InlineKeyboardButton("🗑 Del", callback_data="d_t")], [types.InlineKeyboardButton("🔙 Back", callback_data="back_main")]] if user["thumb"] else [[types.InlineKeyboardButton("🔙 Back", callback_data="back_main")]]
-        await safe_edit(cb.message, "🖼 Thumbnail Manager", reply_markup=types.InlineKeyboardMarkup(btns))
-        return
+    if data == "cb_cancel":
+        DB["active"].pop(uid_s, None); return await safe_edit(cb.message, "❌ Cancelled.")
 
-    if data == "m_adm" and uid == OWNER_ID:
-        btns = [[types.InlineKeyboardButton("📊 Reports", callback_data="a_rep"), types.InlineKeyboardButton("📢 Broadcast", callback_data="a_bc")], [types.InlineKeyboardButton("🛠 Stability", callback_data="a_stb"), types.InlineKeyboardButton("🔙 Back", callback_data="back_main")]]
-        await safe_edit(cb.message, "🛠 Admin Dashboard", reply_markup=types.InlineKeyboardMarkup(btns))
-        return
+    if uid_s not in DB["active"]: return await cb.answer("Expired session.")
+    state = DB["active"][uid_s]
 
-    if data == "a_bc" and uid == OWNER_ID:
-        user["state"] = "pending_bc"; await safe_edit(cb.message, "📢 Send message:"); return
-
-    if data == "bc_yes" and uid == OWNER_ID:
-        msg, count = DB.get("temp_bc"), 0
-        for u in DB["users"]:
-            try: await app.send_message(int(u), f"📢 **Broadcast**\n\n{msg}"); count += 1
-            except: pass
-        await safe_edit(cb.message, f"✅ Sent to {count} users."); DB["temp_bc"] = None; return
-
-    if data == "p_wat":
-        if user["watermark"]: user["watermark"] = None; await cb.answer("Watermark Cleared"); await safe_edit(cb.message, "✅ Ready.", reply_markup=get_ready_btns(uid))
-        else: user["state"] = "set_wat"; await safe_edit(cb.message, "📝 Send Watermark Text:")
-        save_db(); return
-
-    if data == "cancel":
-        DB["active"].pop(uid_str, None); save_db(); await safe_edit(cb.message, "❌ Cancelled."); return
-
-    if uid_str not in DB["active"]: return await cb.answer("Expired.")
-    state = DB["active"][uid_str]
-
-    if data.startswith("dl_"):
-        await safe_edit(cb.message, "⏳ Downloading..."); is_vid = data == "dl_vid"
-        ydl_opts = {'format': 'bestvideo+bestaudio/best' if is_vid else 'bestaudio/best', 'outtmpl': f'{DOWNLOAD_DIR}/%(title)s.%(ext)s'}
-        with YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(state["url"], download=True); path = ydl.prepare_filename(info)
-            if not is_vid: path = os.path.splitext(path)[0] + ".mp3"
+    if data.startswith("yt_"):
+        fmt = data.split("_")[1]
+        await safe_edit(cb.message, f"⏳ Downloading YouTube {fmt}...")
+        y_opts = {'format': f'bestvideo[height<={fmt}]+bestaudio/best' if fmt.isdigit() else 'bestaudio/best', 'outtmpl': f'{DOWNLOAD_DIR}/%(title)s.%(ext)s'}
+        with YoutubeDL(y_opts) as ydl:
+            info = ydl.extract_info(state["url"], download=True)
+            path = ydl.prepare_filename(info)
             state.update({"path": path, "name": os.path.basename(path), "status": "ready"}); save_db()
-            await safe_edit(cb.message, "✅ Ready.", reply_markup=get_ready_btns(uid))
+            await safe_edit(cb.message, "✅ Ready.", reply_markup=get_ready_menu())
 
-    if data.startswith("u_"):
-        await safe_edit(cb.message, "📤 Processing..."); path = state["path"]
-        if user["watermark"]: path = await apply_watermark(path, user["watermark"])
-        user["last_task"] = str(datetime.now())
-        scheduler.add_job(notify_ready, "date", run_date=datetime.now() + timedelta(seconds=(120 if uid==OWNER_ID else 600)), args=[uid])
+    if data == "cb_ren_start": return await safe_edit(cb.message, "✏️ **Rename**", reply_markup=get_rename_options())
+    if data == "cb_ren_def": return await safe_edit(cb.message, "✅ Using default name.", reply_markup=get_ready_menu())
+    if data == "cb_ren_cus": user["state"] = "renaming"; return await safe_edit(cb.message, "📝 Send new name:")
+    if data == "cb_ready_back": return await safe_edit(cb.message, "✅ Ready.", reply_markup=get_ready_menu())
+    
+    if data == "cb_up_start": return await safe_edit(cb.message, "📤 **Upload**", reply_markup=get_upload_options())
+
+    if data.startswith("cb_up_"):
+        await safe_edit(cb.message, "📤 Uploading..."); path = state["path"]
         try:
-            if data == "u_scr":
+            if data == "cb_up_scr":
                 screens = await take_screenshots(path, uid)
                 if screens: await client.send_media_group(uid, screens)
-            if data == "u_vid": await client.send_video(uid, video=path, thumb=user["thumb"], caption=f"`{state['name']}`", progress=progress_hook, progress_args=(cb.message, time.time(), "Uploading"))
-            else: await client.send_document(uid, document=path, thumb=user["thumb"], caption=f"`{state['name']}`", progress=progress_hook, progress_args=(cb.message, time.time(), "Uploading"))
-            if uid != OWNER_ID: user["used"] += state.get("size", 0)
-            save_db(); await cb.message.delete()
+            
+            if data == "cb_up_vid": await client.send_video(uid, video=path, thumb=user["thumb"], caption=f"`{state['name']}`")
+            else: await client.send_document(uid, document=path, thumb=user["thumb"], caption=f"`{state['name']}`")
+            await cb.message.delete()
         finally:
             if os.path.exists(path): os.remove(path)
-            DB["active"].pop(uid_str, None); save_db()
-
-    if data == "u_ren":
-        state["status"] = "renaming"; await safe_edit(cb.message, "📝 Send name:", reply_markup=get_rename_menu())
+            DB["active"].pop(uid_s, None); save_db()
 
 # --- STARTUP ---
 async def main():
@@ -293,7 +217,7 @@ async def main():
     server = web.Application(); server.add_routes([web.get('/', lambda r: web.Response(text="OK"))])
     runner = web.AppRunner(server); await runner.setup()
     await web.TCPSite(runner, '0.0.0.0', 8000).start()
-    scheduler.start(); print("Bot is Master-Ready!"); await idle()
+    await idle()
 
 if __name__ == "__main__":
     app.run(main())
