@@ -1,225 +1,293 @@
-import os, re, shutil, time, asyncio, random
-from datetime import datetime
-from pyrogram import Client, filters, types, enums
-from yt_dlp import YoutubeDL
-from apscheduler.schedulers.asyncio import AsyncIOScheduler
+import os
+import re
+import subprocess
+import requests
+import time
+import asyncio
+from datetime import datetime, timedelta
+from tinydb import TinyDB, Query
 
-# --- HARDCODED CONFIG ---
-API_ID = int(os.getenv("API_ID", 0))
-API_HASH = os.getenv("API_HASH", "")
-BOT_TOKEN = os.getenv("BOT_TOKEN", "")
-CHANNEL_ID = int(os.getenv("CHANNEL_ID", 0)) 
-OWNER_ID = 519459195
-CONTACT_URL = "https://t.me/poocha"
-INVITE_LINK = "https://t.me/+eooytvOAwjc0NTI1"
-DOWNLOAD_DIR = "downloads"
-DAILY_LIMIT = 15 * 1024 * 1024 * 1024 # 15GB
+from pyrogram import Client, filters
+from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 
-# --- IN-MEMORY DATABASE ---
-DB = {"users": {}, "active": {}}
+# ==========================================
+# CONFIGURATION
+# ==========================================
+OWNER_ID = 519459195                     # Your ID
+CHANNEL_LINK = "https://t.me/+eooytvOAwjc0NTI1" 
+CONTACT_LINK = "https://t.me/poocha"     
+DOWNLOAD_DIR = "/tmp/downloads"          
+DB_FILE = "/tmp/bot_state.json"          
+SESSION_NAME = "koyeb_bot_session"
 
-app = Client("dl_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
+# ==========================================
+# DATABASE SETUP
+# ==========================================
+db = TinyDB(DB_FILE)
+users_table = db.table("users")
+bot_state = {}
 
 def get_user(uid):
-    today = datetime.now().date()
-    if uid not in DB["users"]:
-        DB["users"][uid] = {"used": 0, "pro": False, "banned": False, "last_reset": today}
-    if DB["users"][uid]["last_reset"] != today:
-        DB["users"][uid].update({"used": 0, "last_reset": today})
-    return DB["users"][uid]
+    """Checks if user exists in DB. If not, creates new entry."""
+    user = users_table.get(Query().uid == uid)
+    if not user:
+        users_table.insert({
+            "uid": uid, 
+            "is_pro": False, 
+            "usage_gb": 0.0, 
+            "links_count": 0
+        })
+        return users_table.get(Query().uid == uid)
+    return user
 
-def format_size(size):
-    if not size: return "0B"
-    for unit in ['B', 'KB', 'MB', 'GB']:
-        if size < 1024: return f"{size:.1f}{unit}"
-        size /= 1024
-    return f"{size:.1f}TB"
+# ==========================================
+# UTILITIES
+# ==========================================
 
-async def is_subscribed(uid):
-    if uid == OWNER_ID: return True
-    try:
-        member = await app.get_chat_member(CHANNEL_ID, uid)
-        return member.status in [enums.ChatMemberStatus.MEMBER, enums.ChatMemberStatus.ADMINISTRATOR, enums.ChatMemberStatus.OWNER]
-    except: return False
+def get_disk_usage(directory):
+    """Calculates total space used in GB."""
+    total_size = 0
+    for dirpath, _, filenames in os.walk(directory):
+        for f in filenames:
+            fp = os.path.join(dirpath, f)
+            if not os.path.islink(fp):
+                total_size += os.path.getsize(fp)
+    return total_size / (1024**3)
 
-async def auto_clean():
-    """Clears files older than 1 hour to save Koyeb disk space"""
-    now = time.time()
-    for uid, data in list(DB["active"].items()):
-        if now - data.get("time", 0) > 3600:
-            if "path" in data and os.path.exists(data["path"]):
-                try: os.remove(data["path"])
-                except: pass
-            DB["active"].pop(uid, None)
-
-# --- KEYBOARDS ---
-def get_admin_btns():
-    return types.InlineKeyboardMarkup([
-        [types.InlineKeyboardButton("📊 User Stats", callback_data="adm_stats"),
-         types.InlineKeyboardButton("💾 Disk Usage", callback_data="adm_disk")],
-        [types.InlineKeyboardButton("🔗 Active Links", callback_data="adm_links")]
+def generate_admin_buttons():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("📊 Stats & Usage", callback_data="admin_stats")],
+        [InlineKeyboardButton("💾 Disk Space", callback_data="admin_disk")],
+        [InlineKeyboardButton("🚹 Clear Downloads", callback_data="admin_clear")]
     ])
 
-def get_action_btns():
-    return types.InlineKeyboardMarkup([
-        [types.InlineKeyboardButton("Upload ⬆️", callback_data="upload")],
-        [types.InlineKeyboardButton("Rename ✏️", callback_data="rename"),
-         types.InlineKeyboardButton("Cancel ❌", callback_data="cancel")]
+def generate_ready_buttons(filename: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("📤 Upload", callback_data=f"upload_{filename}")],
+        [InlineKeyboardButton("✏️ Rename", callback_data="rename")],
+        [InlineKeyboardButton("❌ Cancel", callback_data="cancel")]
     ])
 
-# --- OWNER COMMANDS ---
-@app.on_message(filters.command("admin") & filters.user(OWNER_ID))
-async def admin_panel(_, m):
-    await m.reply("🛠 **Admin Dashboard**", reply_markup=get_admin_btns())
+async def cleanup_user(uid):
+    """Removes active file from memory and disk."""
+    if uid in bot_state:
+        path = bot_state[uid].get('file')
+        if path and os.path.exists(path):
+            try: os.remove(path)
+            except: pass
+        del bot_state[uid]
 
-@app.on_message(filters.command("pro") & filters.user(OWNER_ID))
-async def make_pro(_, m):
+# --- 18+ NSFW FILTER ---
+async def check_nsfw(url):
+    """Checks YouTube metadata for adult keywords."""
+    if "youtube" not in url: return False
     try:
-        target = int(m.command[1]); get_user(target)["pro"] = True
-        await m.reply(f"✅ User {target} is now PRO.")
-    except: await m.reply("Usage: /pro [user_id]")
+        cmd = ['yt-dlp', '--skip-download', '--print', "%(title)s %(description)s", url]
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+        text = (result.stdout + result.stderr).lower()
+        blocked = ["porn", "sex", "nsfw", "xxx", "adult", "anal", "free porn", "solo"]
+        for word in blocked:
+            if word in text: return True
+    except Exception:
+        pass
+    return False
 
-@app.on_message(filters.command("broadcast") & filters.user(OWNER_ID))
-async def broadcast(_, m):
-    if len(m.command) < 2: return
-    text = m.text.split(None, 1)[1]
-    for uid in DB["users"]:
-        try: await app.send_message(uid, f"📢 **Announcement:**\n\n{text}")
-        except: pass
+# ==========================================
+# BOT SETUP
+# ==========================================
+app = Client(
+    name=SESSION_NAME,
+    api_id=int(os.getenv("API_ID")),
+    api_hash=os.getenv("API_HASH"),
+    bot_token=os.getenv("BOT_TOKEN"),
+)
 
-# --- MAIN HANDLERS ---
-@app.on_message(filters.text)
-async def handle_message(client, m):
-    uid = m.from_user.id
-    user = get_user(uid)
-    if user["banned"]: return
+# ==========================================
+# ADMIN COMMANDS
+# ==========================================
 
-    # 1. Force Subscription Check
-    if not await is_subscribed(uid):
-        btn = types.InlineKeyboardMarkup([[types.InlineKeyboardButton("Join Channel", url=INVITE_LINK)]])
-        return await m.reply("⚠️ **Access Denied!**\nYou must join our channel to use this bot.", reply_markup=btn)
+@app.on_message(filters.command("admin") & filters.chat(OWNER_ID))
+async def admin_command(client, msg):
+    """Main Admin Dashboard Menu."""
+    await msg.reply("🛡️ **Admin Panel**", reply_markup=generate_admin_buttons())
 
-    # 2. Rename Flow
-    if uid in DB["active"] and DB["active"][uid].get("status") == "renaming":
-        state = DB["active"][uid]
-        ext = os.path.splitext(state["path"])[1]
-        new_name = m.text if m.text.endswith(ext) else f"{m.text}{ext}"
-        new_path = os.path.join(DOWNLOAD_DIR, new_name)
+@app.on_callback_query(lambda q: q.data.startswith("admin_") & filters.chat(OWNER_ID))
+async def admin_action(client, query):
+    """Handles Admin Actions."""
+    if query.data == "admin_stats":
+        await query.answer()
+        total_users = users_table.count()
+        total_links = sum(u['links_count'] for u in users_table.all())
+        
+        msg = f"📊 **System Statistics**:\n\n"
+        msg += f"👥 Active Users: {total_users}\n"
+        msg += f"🔗 Total Links Processed: {total_links}\n"
+        
+        await query.message.edit(f"Generating full report...", reply_markup=None)
+        await query.message.delete()
+        await client.send_message(OWNER_ID, msg, disable_web_page_preview=True)
+        
+    elif query.data == "admin_disk":
+        await query.answer()
+        disk_gb = get_disk_usage(DOWNLOAD_DIR)
+        msg = f"💾 **Disk Usage**: {disk_gb:.2f} GB"
+        await client.send_message(OWNER_ID, msg)
+        
+    elif query.data == "admin_clear":
+        await query.answer("Clearing files...")
         try:
-            os.rename(state["path"], new_path)
-            DB["active"][uid].update({"path": new_path, "name": new_name, "status": "ready"})
-            return await m.reply(f"✅ Renamed: `{new_name}`", reply_markup=get_action_btns())
-        except Exception as e: return await m.reply(f"❌ Rename error: {e}")
+            for filename in os.listdir(DOWNLOAD_DIR):
+                os.remove(os.path.join(DOWNLOAD_DIR, filename))
+            await client.send_message(OWNER_ID, "✅ Bot Cache cleared.")
+        except Exception as e:
+            await client.send_message(OWNER_ID, f"❌ Error: {e}")
 
-    # 3. Media Link Handling
-    if m.text.startswith("http"):
-        # Usage Limit Check
-        if uid != OWNER_ID and not user["pro"] and user["used"] >= DAILY_LIMIT:
-            return await m.reply("❌ **15GB Daily Limit Reached!**", reply_markup=types.InlineKeyboardMarkup([[types.InlineKeyboardButton("🚀 Upgrade to Pro", url=CONTACT_URL)]]))
+# ==========================================
+# USER HANDLERS
+# ==========================================
 
-        # Random promo for free users
-        if uid != OWNER_ID and not user["pro"]:
-            await m.reply(random.choice(["⚡ Pro users get unlimited usage!", "💎 No NSFW restrictions for Pro users."]), reply_markup=types.InlineKeyboardMarkup([[types.InlineKeyboardButton("Contact Admin", url=CONTACT_URL)]]))
+async def check_channel_membership(client, user_id):
+    """Verifies if user is subscribed to the channel."""
+    try:
+        # Requires bot to be admin in the channel
+        chat_id = await client.get_chat(CHANNEL_LINK)
+        member = await client.get_chat_member(chat_id.id, user_id)
+        return member.status in ['member', 'administrator', 'creator']
+    except Exception:
+        return False
 
-        status_msg = await m.reply("🔍 Detecting Media...")
-        try:
-            with YoutubeDL({'quiet': True, 'no_warnings': True}) as ydl:
-                info = ydl.extract_info(m.text, download=False)
-                
-                # NSFW Check
-                trigger_words = ["porn", "xvideo", "hentai", "sex", "nude", "xxx", "erotic"]
-                is_nsfw = any(w in info.get("title","").lower() for w in trigger_words) or info.get("age_limit",0) >= 18
-                if uid != OWNER_ID and not user["pro"] and is_nsfw:
-                    return await status_msg.edit("🔞 **NSFW Restricted!**\nAdult content is only available for Pro users.", reply_markup=types.InlineKeyboardMarkup([[types.InlineKeyboardButton("Upgrade", url=CONTACT_URL)]]))
-
-                size = info.get('filesize') or info.get('filesize_approx') or 0
-                
-                # Owner Monitoring
-                if uid != OWNER_ID:
-                    await app.send_message(OWNER_ID, f"👁️ **User Uploading:**\nID: `{uid}`\nFile: `{info.get('title')}`\nSize: {format_size(size)}")
-
-                # YouTube Logic
-                if "youtube.com" in m.text or "youtu.be" in m.text:
-                    DB["active"][uid] = {"url": m.text, "time": time.time(), "status": "choosing"}
-                    btns = [[types.InlineKeyboardButton(f"Video ({format_size(size)})", callback_data="dl_vid")],
-                            [types.InlineKeyboardButton("Audio (MP3 Extract)", callback_data="dl_aud")],
-                            [types.InlineKeyboardButton("Cancel", callback_data="cancel")]]
-                    return await status_msg.edit("🎬 YouTube Detected. Choose format:", reply_markup=types.InlineKeyboardMarkup(btns))
-                
-                # Direct / Generic Logic
-                await status_msg.edit("⏳ Downloading...")
-                path = ydl.prepare_filename(info)
-                ydl.download([m.text])
-                DB["active"][uid] = {"path": path, "name": os.path.basename(path), "status": "ready", "time": time.time()}
-                user["used"] += size
-                await status_msg.edit(f"✅ Ready! Daily Usage: {format_size(user['used'])}", reply_markup=get_action_btns())
-
-        except Exception as e: await status_msg.edit(f"❌ Failed: {str(e)[:100]}")
-
-@app.on_callback_query()
-async def cb_handler(client, cb: types.CallbackQuery):
-    uid = cb.from_user.id
-    data = cb.data
-
-    # Admin Callback Logic
-    if data.startswith("adm_") and uid == OWNER_ID:
-        if data == "adm_stats":
-            await cb.answer(f"Users: {len(DB['users'])} | Active: {len(DB['active'])}", show_alert=True)
-        elif data == "adm_disk":
-            total, used, free = shutil.disk_usage("/")
-            await cb.answer(f"Server Disk: {format_size(used)} / {format_size(total)}", show_alert=True)
-        elif data == "adm_links":
-            links = "\n".join([f"`{k}`: {v.get('name', 'Analysing')}" for k,v in DB["active"].items()])
-            await cb.message.reply(f"🔗 **Active Links:**\n{links or 'None'}")
+@app.on_message(filters.command("start"))
+async def start_handler(client, msg):
+    user_id = msg.from_user.id
+    
+    # 1. CHECK IF ADMIN
+    if user_id == OWNER_ID:
+        await msg.reply("🛡️ **Admin Mode**", reply_markup=generate_admin_buttons())
         return
 
-    if uid not in DB["active"]: return await cb.answer("Session expired. Please send link again.")
-    state = DB["active"][uid]
+    # 2. CHECK CHANNEL SUBSCRIPTION
+    is_member = await check_channel_membership(client, user_id)
+    if not is_member:
+        await msg.reply(
+            f"⛔ **Access Denied**\nPlease subscribe to our channel first:\n{CHANNEL_LINK}", 
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("✅ Check/Join Channel", url=CHANNEL_LINK)]
+            ])
+        )
+        return
 
-    if data.startswith("dl_"):
-        await cb.message.edit("⏳ Processing media... please wait.")
-        is_vid = data == "dl_vid"
-        opts = {
-            'format': 'bestvideo+bestaudio/best' if is_vid else 'bestaudio/best',
-            'outtmpl': f'{DOWNLOAD_DIR}/%(title)s.%(ext)s',
-            'postprocessors': [{'key': 'FFmpegExtractAudio','preferredcodec': 'mp3'}] if not is_vid else [],
-            'quiet': True
-        }
+    # 3. REGISTER USER IF NEW
+    get_user(user_id)
+    await msg.reply(f"✅ **Welcome!** Usage limit: 15GB/Day.")
+
+# ==========================================
+# MAIN LOGIC (Owner Link Handling)
+# ==========================================
+@app.on_message(filters.chat(OWNER_ID) & filters.text)
+async def main_handler(client, msg):
+    user_id = msg.from_user.id
+    text = msg.text.strip()
+
+    if text.startswith("/cancel"): 
+        await cleanup_user(user_id)
+        return
+    
+    if text.startswith("/rename"):
+        if user_id in bot_state:
+            await msg.reply("Send new name:")
+            bot_state[user_id]['state'] = 'rename_pending'
+        return
+
+    if text.startswith("http"):
+        # NSFW Check for Owner
+        if "youtube" in text and await check_nsfw(text):
+            await msg.reply("⛔ NSFW content detected. Refusing.")
+            return
+
+        if "youtube" in text: await select_youtube_format(client, msg, text)
+        else: await handle_download(client, msg, text)
+
+# ==========================================
+# CALLBACK HANDLERS (Upload, Rename, etc)
+# ==========================================
+@app.on_callback_query()
+async def callback_handler(client, query):
+    user_id = query.from_user.id
+    if user_id != OWNER_ID:
+        await query.answer("Unauthorized", show_alert=True)
+        return
+
+    if query.data == "cancel":
+        await cleanup_user(user_id)
+        await query.message.edit_text("❌ Cancelled.")
+    elif query.data == "rename":
+        bot_state[user_id]['state'] = 'rename_pending'
+        await query.message.edit_text("📝 Send new name:")
+    elif query.data.startswith("upload_"):
+        _, filename = query.data.split("_", 1)
+        path = bot_state[user_id]['file']
+        
         try:
-            with YoutubeDL(opts) as ydl:
-                info = ydl.extract_info(state["url"], download=True)
-                path = ydl.prepare_filename(info)
-                if not is_vid: path = os.path.splitext(path)[0] + ".mp3"
-                DB["active"][uid].update({"path": path, "name": os.path.basename(path), "status": "ready"})
-                await cb.message.edit(f"✅ Ready: `{os.path.basename(path)}`", reply_markup=get_action_btns())
-        except Exception as e: await cb.message.edit(f"❌ Error: {e}")
+            # INCREMENT LINK COUNTER
+            user_data = get_user(user_id)
+            users_table.update({"links_count": user_data['links_count'] + 1}, Query().uid == user_id)
+            
+            is_video = filename.endswith(('.mp4', '.webm', '.mkv'))
+            if is_video: await client.send_video(chat_id=query.message.chat.id, video=path, caption="Sent")
+            else: await client.send_document(chat_id=query.message.chat.id, document=path, filename=filename)
+            
+            await cleanup_user(user_id)
+            await query.message.delete()
+        except Exception as e:
+            await query.message.edit_text(f"Error: {e}")
 
-    elif data == "upload":
-        await cb.message.edit("📤 Uploading to Telegram...")
-        try:
-            p = state["path"]
-            if p.lower().endswith(('.mp4', '.mkv', '.mov', '.webm')):
-                await client.send_video(uid, video=p, caption=f"`{state['name']}`", supports_streaming=True)
-            else:
-                await client.send_document(uid, document=p, caption=f"`{state['name']}`")
-            await cb.message.delete()
-        except Exception as e: await cb.message.reply(f"❌ Upload failed: {e}")
-        finally:
-            if os.path.exists(state["path"]): os.remove(state["path"])
-            DB["active"].pop(uid, None)
+# ==========================================
+# HELPER FUNCTIONS
+# ==========================================
 
-    elif data == "rename":
-        DB["active"][uid]["status"] = "renaming"
-        await cb.message.edit("📝 Send me the new filename with extension (e.g. video.mp4):")
+async def select_youtube_format(client, msg, url):
+    bot_state[msg.from_user.id] = {'url': url}
+    await msg.reply("YouTube detected.\nChoose format:", reply_markup=InlineKeyboardMarkup([
+        [InlineKeyboardButton("🎬 Video", callback_data="yt_video"), InlineKeyboardButton("🎵 Audio", callback_data="yt_audio")],
+        [InlineKeyboardButton("❌ Cancel", callback_data="cancel")]
+    ]))
 
-    elif data == "cancel":
-        if "path" in state and os.path.exists(state["path"]): os.remove(state["path"])
-        DB["active"].pop(uid, None)
-        await cb.message.edit("❌ Session Cancelled and files deleted.")
+async def download_youtube_file(client, msg, url, quality):
+    status = await msg.reply("⏳ Downloading...")
+    filename = "yt_temp.%(ext)s"
+    try:
+        if quality == "audio": cmd = ['yt-dlp', '-x', '--audio-format', 'mp3', '-o', filename, url]
+        else: cmd = ['yt-dlp', '-f', 'bestvideo+bestaudio/best', '-merge-output-format', 'mp4', '-o', filename, url]
+        subprocess.run(cmd, check=True, timeout=300)
+        files = [f for f in os.listdir(DOWNLOAD_DIR) if f.startswith("yt_temp")]
+        if files: await show_ready_state(client, msg, os.path.join(DOWNLOAD_DIR, files[0]))
+        else: await status.edit("❌ Error.")
+    except Exception as e:
+        await status.edit(f"❌ Error: {e}")
+
+async def handle_download(client, msg, url):
+    status = await msg.reply("⏳ Downloading...")
+    filename = "generic.%(ext)s"
+    try:
+        subprocess.run(['yt-dlp', '-f', 'best', '--no-playlist', '-o', filename, url], check=True, timeout=300)
+    except: pass
+    files = [f for f in os.listdir(DOWNLOAD_DIR) if f.startswith("generic")]
+    if files: await show_ready_state(client, msg, os.path.join(DOWNLOAD_DIR, files[0]))
+    else: status.edit("❌ Failed.")
+
+async def show_ready_state(client, msg, file_path):
+    filename = os.path.basename(file_path)
+    bot_state[msg.from_user.id] = {'file': file_path, 'state': 'ready'}
+    await client.send_message(msg.chat.id, f"File Ready: <code>{filename}</code>", reply_markup=generate_ready_buttons(filename))
+
+@app.on_callback_query()
+async def yt_callback(client, query):
+    if query.data == "yt_video":
+        await query.answer()
+        await download_youtube_file(client, query.message, bot_state[query.from_user.id]['url'], "video")
+    elif query.data == "yt_audio":
+        await query.answer()
+        await download_youtube_file(client, query.message, bot_state[query.from_user.id]['url'], "audio")
 
 if __name__ == "__main__":
-    if not os.path.exists(DOWNLOAD_DIR): os.makedirs(DOWNLOAD_DIR)
-    scheduler = AsyncIOScheduler()
-    scheduler.add_job(auto_clean, "interval", minutes=30) # Cleanup check every 30 mins
-    scheduler.start()
     app.run()
