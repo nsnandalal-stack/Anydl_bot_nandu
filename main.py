@@ -1,38 +1,30 @@
- import os
-import sys
+from aiohttp import web
 
-# Check environment variables before anything else
-API_ID = os.environ.get("API_ID")
-API_HASH = os.environ.get("API_HASH")
-SESSION_STRING = os.environ.get("SESSION_STRING")
+# Dummy web server for Koyeb health checks
+async def health_check(request):
+    return web.Response(text="Bot is Alive")
 
-print("=" * 50)
-print("Checking Environment Variables...")
-print(f"API_ID: {'✓ Set' if API_ID else '✗ MISSING'}")
-print(f"API_HASH: {'✓ Set' if API_HASH else '✗ MISSING'}")
-print(f"SESSION_STRING: {'✓ Set' if SESSION_STRING else '✗ MISSING'}")
-print("=" * 50)
+async def main():
+    if not os.path.exists(DOWNLOAD_DIR): os.makedirs(DOWNLOAD_DIR)
+    
+    # 1. Start Bot
+    await app.start()
+    
+    # 2. Start Scheduler
+    scheduler = AsyncIOScheduler()
+    scheduler.add_job(lambda: DB["active"].clear(), "interval", hours=1)
+    scheduler.start()
+    
+    # 3. Start Dummy Web Server on Port 8000
+    server = web.Application()
+    server.add_routes([web.get('/', health_check)])
+    runner = web.AppRunner(server)
+    await runner.setup()
+    site = web.TCPSite(runner, '0.0.0.0', 8000)
+    await site.start()
+    
+    print("Bot is Started Successfully with Health Check on Port 8000")
+    await idle()
 
-# Stop if variables are missing
-missing = []
-if not API_ID:
-    missing.append("API_ID")
-if not API_HASH:
-    missing.append("API_HASH")
-if not SESSION_STRING:
-    missing.append("SESSION_STRING")
-
-if missing:
-    print(f"❌ ERROR: Missing environment variables: {', '.join(missing)}")
-    print("Please set them in Koyeb dashboard:")
-    print("Service → Settings → Environment Variables")
-    sys.exit(1)
-
-# Convert API_ID to integer
-try:
-    API_ID = int(API_ID)
-except ValueError:
-    print(f"❌ ERROR: API_ID must be a number, got: {API_ID}")
-    sys.exit(1)
-
-print("✓ All environment variables are set correctly!")
+if __name__ == "__main__":
+    app.run(main())
