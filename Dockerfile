@@ -4,5 +4,5 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 COPY main.py .
-RUN mkdir downloads
+RUN mkdir downloads thumbnails
 CMD ["python", "main.py"]
