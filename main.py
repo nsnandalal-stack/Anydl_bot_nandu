@@ -15,6 +15,7 @@ from yt_dlp import YoutubeDL
 # Config
 # =======================
 OWNER_ID = 519459195
+
 API_ID = int(os.getenv("API_ID", "0"))
 API_HASH = os.getenv("API_HASH", "")
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
@@ -28,12 +29,24 @@ THUMB_DIR = "/app/thumbnails"
 DB_FILE = "/app/database.json"
 COOKIES_FILE = "/app/cookies.txt"
 
-app = Client("dl_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN, sleep_threshold=120)
+# =======================
+# Pyrogram client
+# =======================
+app = Client(
+    "dl_bot",
+    api_id=API_ID,
+    api_hash=API_HASH,
+    bot_token=BOT_TOKEN,
+    sleep_threshold=120
+)
 
 # =======================
 # Persistence
 # =======================
-DB = {"users": {}, "active": {}}
+DB = {
+    "users": {},   # uid(str): {"thumb": str|None, "state": "none|await_thumb|await_rename|await_bc_text", "pending": {}}
+    "active": {},  # uid(str): {"status": ..., "path": ..., "name": ..., "ext": ..., "url": ..., "cancel": bool}
+}
 
 def db_load():
     global DB
@@ -133,6 +146,9 @@ async def is_subscribed(uid: int) -> bool:
     except Exception:
         return False
 
+# =======================
+# Keyboards
+# =======================
 def join_markup():
     return types.InlineKeyboardMarkup([
         [types.InlineKeyboardButton("Join Channel", url=INVITE_LINK)],
@@ -155,12 +171,13 @@ def main_menu_markup(uid: int):
     return types.InlineKeyboardMarkup(kb)
 
 def thumb_menu_markup():
-    # STRICT: only View/Delete
+    # STRICT: only View/Delete + Exit
     return types.InlineKeyboardMarkup([
         [
             types.InlineKeyboardButton("View Thumbnail", callback_data="thumb_view"),
             types.InlineKeyboardButton("Delete Thumbnail", callback_data="thumb_delete"),
-        ]
+        ],
+        [types.InlineKeyboardButton("Exit", callback_data="thumb_exit")]
     ])
 
 def ready_markup():
@@ -217,7 +234,7 @@ def broadcast_confirm_markup():
     ])
 
 # =======================
-# Media functions
+# yt-dlp helpers
 # =======================
 def ydl_base_opts():
     opts = {
@@ -252,6 +269,9 @@ async def download_youtube(url: str, kind: str, value: str) -> tuple[str, str]:
             path = os.path.splitext(path)[0] + "." + value
         return path, os.path.basename(path)
 
+# =======================
+# Screenshots + upload progress
+# =======================
 async def generate_screenshots(video_path: str, uid: int):
     out_dir = os.path.join(DOWNLOAD_DIR, f"screens_{uid}")
     os.makedirs(out_dir, exist_ok=True)
@@ -384,7 +404,10 @@ async def on_forwarded(_, m: types.Message):
     if not media:
         return
 
-    status = await m.reply_text("Downloading…", reply_markup=types.InlineKeyboardMarkup([[types.InlineKeyboardButton("Cancel", callback_data="act_cancel")]]))
+    status = await m.reply_text(
+        "Downloading…",
+        reply_markup=types.InlineKeyboardMarkup([[types.InlineKeyboardButton("Cancel", callback_data="act_cancel")]])
+    )
     path = os.path.join(DOWNLOAD_DIR, f"fwd_{uid}_{int(time.time())}")
     session_set(uid, {"cancel": False})
 
@@ -398,14 +421,7 @@ async def on_forwarded(_, m: types.Message):
     name = safe_filename(orig)
     ext = os.path.splitext(name)[1] or os.path.splitext(path)[1] or ""
 
-    sess = {
-        "path": path,
-        "orig_name": name,
-        "name": name,
-        "ext": ext,
-        "status": "ready",
-        "cancel": False,
-    }
+    sess = {"path": path, "orig_name": name, "name": name, "ext": ext, "status": "ready", "cancel": False}
     session_set(uid, sess)
     await safe_edit(status, f"Downloaded: `{name}`", reply_markup=ready_markup())
 
@@ -457,7 +473,10 @@ async def on_text(_, m: types.Message):
         await m.reply_text("Join channel first.", reply_markup=join_markup())
         return
 
-    status = await m.reply_text("Analyzing…", reply_markup=types.InlineKeyboardMarkup([[types.InlineKeyboardButton("Cancel", callback_data="act_cancel")]]))
+    status = await m.reply_text(
+        "Analyzing…",
+        reply_markup=types.InlineKeyboardMarkup([[types.InlineKeyboardButton("Cancel", callback_data="act_cancel")]])
+    )
     session_set(uid, {"cancel": False})
 
     if is_youtube(text):
@@ -465,7 +484,11 @@ async def on_text(_, m: types.Message):
         return await safe_edit(status, "YouTube detected. Select a format:", reply_markup=youtube_format_markup())
 
     try:
-        await safe_edit(status, "Downloading…", reply_markup=types.InlineKeyboardMarkup([[types.InlineKeyboardButton("Cancel", callback_data="act_cancel")]]))
+        await safe_edit(
+            status,
+            "Downloading…",
+            reply_markup=types.InlineKeyboardMarkup([[types.InlineKeyboardButton("Cancel", callback_data="act_cancel")]])
+        )
         path, name = await download_generic(text)
         ext = os.path.splitext(name)[1]
         sess = {"path": path, "orig_name": name, "name": name, "ext": ext, "status": "ready", "cancel": False}
@@ -518,8 +541,14 @@ async def on_cb(_, cb: types.CallbackQuery):
         db_save()
         await cb.answer("Deleted.", show_alert=True)
         return
+    if data == "thumb_exit":
+        try:
+            await cb.message.delete()
+        except Exception:
+            pass
+        return
 
-    # join verify (no loops)
+    # join verify
     if data == "join_verify":
         ok = await is_subscribed(uid)
         if ok:
@@ -578,11 +607,16 @@ async def on_cb(_, cb: types.CallbackQuery):
     # cancel (global)
     if data == "act_cancel":
         sess = session_get(uid)
+        if sess:
+            sess["cancel"] = True
+            session_set(uid, sess)
+
         if sess and sess.get("path") and os.path.exists(sess["path"]):
             try:
                 os.remove(sess["path"])
             except Exception:
                 pass
+
         session_clear(uid)
         return await safe_edit(cb.message, "Cancelled.", reply_markup=None)
 
@@ -595,7 +629,8 @@ async def on_cb(_, cb: types.CallbackQuery):
     if data.startswith("yt_v_"):
         h = data.split("_")[-1]
         try:
-            await safe_edit(cb.message, f"Downloading YouTube video {h}p…", reply_markup=types.InlineKeyboardMarkup([[types.InlineKeyboardButton("Cancel", callback_data="act_cancel")]]))
+            await safe_edit(cb.message, f"Downloading YouTube video {h}p…",
+                            reply_markup=types.InlineKeyboardMarkup([[types.InlineKeyboardButton("Cancel", callback_data="act_cancel")]]))
             path, name = await download_youtube(sess["url"], "v", h)
             ext = os.path.splitext(name)[1]
             session_set(uid, {"path": path, "orig_name": name, "name": name, "ext": ext, "status": "ready", "cancel": False})
@@ -607,7 +642,8 @@ async def on_cb(_, cb: types.CallbackQuery):
     if data.startswith("yt_a_"):
         codec = data.split("_")[-1]
         try:
-            await safe_edit(cb.message, f"Downloading YouTube audio {codec.upper()}…", reply_markup=types.InlineKeyboardMarkup([[types.InlineKeyboardButton("Cancel", callback_data="act_cancel")]]))
+            await safe_edit(cb.message, f"Downloading YouTube audio {codec.upper()}…",
+                            reply_markup=types.InlineKeyboardMarkup([[types.InlineKeyboardButton("Cancel", callback_data="act_cancel")]]))
             path, name = await download_youtube(sess["url"], "a", codec)
             ext = os.path.splitext(name)[1]
             session_set(uid, {"path": path, "orig_name": name, "name": name, "ext": ext, "status": "ready", "cancel": False})
@@ -619,10 +655,12 @@ async def on_cb(_, cb: types.CallbackQuery):
     # rename
     if data == "act_rename":
         return await safe_edit(cb.message, "Rename:", reply_markup=rename_choice_markup())
+
     if data == "ren_default":
         u["state"] = "none"
         db_save()
         return await safe_edit(cb.message, f"Using default name: `{sess.get('name')}`", reply_markup=ready_markup())
+
     if data == "ren_custom":
         u["state"] = "await_rename_name"
         db_save()
@@ -641,7 +679,6 @@ async def on_cb(_, cb: types.CallbackQuery):
         do_screens = (data == "up_with_screens")
 
         try:
-            # screenshots only for video upload
             if do_screens:
                 medias, outdir = await generate_screenshots(sess["path"], uid)
                 if medias:
@@ -653,6 +690,7 @@ async def on_cb(_, cb: types.CallbackQuery):
                 "Uploading…",
                 reply_markup=types.InlineKeyboardMarkup([[types.InlineKeyboardButton("Cancel", callback_data="act_cancel")]])
             )
+
             await upload_with_progress(uid, prog_msg, sess["path"], as_video, thumb)
 
             # delete from server after upload
@@ -670,7 +708,6 @@ async def on_cb(_, cb: types.CallbackQuery):
 
             return await safe_edit(cb.message, "Done.", reply_markup=None)
         except Exception as e:
-            # always cleanup on error
             try:
                 if sess.get("path") and os.path.exists(sess["path"]):
                     os.remove(sess["path"])
@@ -691,6 +728,7 @@ async def main():
 
     await app.start()
 
+    # Koyeb health server
     srv = web.Application()
     srv.add_routes([web.get("/", health)])
     runner = web.AppRunner(srv)
@@ -701,4 +739,4 @@ async def main():
     await app.stop()
 
 if __name__ == "__main__":
-    app.run(main)
+    app.run(main())
