@@ -1,12 +1,6 @@
-FROM python:3.10-slim
-
-RUN apt-get update && apt-get install -y ffmpeg nodejs && rm -rf /var/lib/apt/lists/*
-
+FROM python:3.11-slim
 WORKDIR /app
-COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
-
-COPY main.py .
-RUN mkdir -p downloads thumbnails
-
-CMD ["python", "main.py"]
+RUN apt-get update && apt-get install -y ffmpeg yt-dlp curl
+COPY . .
+RUN pip install -r requirements.txt
+ENTRYPOINT ["python", "main.py"]
