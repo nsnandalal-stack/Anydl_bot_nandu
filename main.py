@@ -277,16 +277,19 @@ def ydl_opts_with_progress(uid: int, msg: types.Message):
             total = d.get("total_bytes") or 0
             done = d.get("downloaded_bytes") or 0
             eta = d.get("eta")
+            speed = d.get("speed")
             pct = (done / total * 100) if total else 0.0
             
-            # Update only if 2s passed OR pct changed by 5%
-            if now - last_update["t"] < 2.0 and abs(pct - last_update["pct"]) < 5: return
+            if now - last_update["t"] < 2.0 and abs(pct - last_update["pct"]) < 5:
+                return
             
             last_update["t"] = now
             last_update["pct"] = pct
             
-            text = create_progress_bar(pct, d.get("speed"), eta, total, done)
-            asyncio.get_event_loop().create_task(safe_edit(msg, text, reply_markup=cancel_kb()))
+            text = create_progress_bar(pct, speed, eta, total, done)
+            asyncio.get_event_loop().create_task(
+                safe_edit(msg, text, reply_markup=cancel_kb())
+            )
         except: pass
             
     opts = {
@@ -393,7 +396,7 @@ async def upload_with_progress(uid: int, msg: types.Message, path: str, as_video
         last["t"] = now
         speed = cur / max(1, now - start)
         eta = (tot - cur) / speed if speed > 0 and tot else None
-        text = create_progress_bar((cur/tot*100) if tot else 0, speed, eta, tot, cur).replace("Downloading", "Uploading")
+        text = create_progress_bar((cur/tot*100) if tot else 0, speed, eta, tot, cur)
         await safe_edit(msg, text, reply_markup=cancel_kb())
         
     if as_video:
@@ -569,12 +572,8 @@ async def on_cb(_, cb: types.CallbackQuery):
     data = cb.data
     u = user_get(uid)
     
-    try:
-        await cb.answer()
-    except errors.QueryIdInvalid:
-        pass 
-    except Exception:
-        pass 
+    try: await cb.answer()
+    except: pass
     
     if u.get("is_banned"): return
 
@@ -602,11 +601,9 @@ async def on_cb(_, cb: types.CallbackQuery):
 
     if data == "join_verify":
         ok = await is_subscribed(uid)
-        if ok:
-            return await safe_edit(cb.message, "✅ Verified.", reply_markup=menu_kb(uid))
+        if ok: return await safe_edit(cb.message, "✅ Verified.", reply_markup=menu_kb(uid))
         return await safe_edit(cb.message, "Join channel first.", reply_markup=join_kb())
 
-    # Thumbnail
     if data == "thumb_menu":
         return await safe_edit(cb.message, "Thumbnail Manager", reply_markup=thumb_menu_kb())
     if data == "thumb_view":
@@ -651,12 +648,12 @@ async def on_cb(_, cb: types.CallbackQuery):
     if data == "admin_back":
         return await safe_edit(cb.message, "Main menu", reply_markup=menu_kb(uid))
     if data == "admin_reports":
-        if uid != OWNER_ID: return
+        if uid != OWNER_ID: return await cb.answer("Not allowed.", show_alert=True)
         total, used, free = shutil.disk_usage("/")
-        txt = f"Users: {len(DB['users'])}\nActive: {len(DB['active'])}\nCache: {len(DB['cache'])}\nDisk used: {human_size(used)} / {human_size(total)}"
+        txt = f"Users: {len(DB['users'])}\nActive: {len(DB['active'])}\nDisk: {human_size(used)}/{human_size(total)}"
         return await safe_edit(cb.message, txt, reply_markup=admin_kb())
     if data == "admin_broadcast":
-        if uid != OWNER_ID: return
+        if uid != OWNER_ID: return await cb.answer("Not allowed.", show_alert=True)
         u["state"] = "await_bc_text"
         db_save()
         return await safe_edit(cb.message, "Send broadcast text now.", reply_markup=admin_kb())
@@ -670,7 +667,6 @@ async def on_cb(_, cb: types.CallbackQuery):
         u["state"] = "await_ban_id"
         db_save()
         return await safe_edit(cb.message, "Send User ID to ban:", reply_markup=admin_kb())
-
     if data == "bc_stop":
         if uid != OWNER_ID: return
         u["pending"]["broadcast_text"] = ""
@@ -787,8 +783,7 @@ async def on_cb(_, cb: types.CallbackQuery):
 
     # Cached flows
     if data == "cache_video":
-        # logic for cached send would go here if file_id caching was fully enabled
-        # keeping minimal for stability
+        # logic for cached send...
         pass
 
 # =======================
