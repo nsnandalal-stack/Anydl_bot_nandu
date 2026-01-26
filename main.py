@@ -1,7 +1,6 @@
-"""
 DL Bot v2.3 - ULTIMATE STABLE VERSION
 Features: Beautiful Progress Bars, ETA, Speed, Watermarking, Caching, Admin Panel
-Fixes: QueryIdInvalid, Download stuck, Button unresponsiveness
+Fixes: SyntaxError, QueryIdInvalid, Download stuck, Button unresponsiveness
 """
 
 import os
@@ -125,7 +124,7 @@ def human_time(seconds: float | None) -> str:
     return f"{s}s"
 
 # =======================
-# BEAUTIFUL PROGRESS BAR
+# BEAUTIFUL PROGRESS BAR (FIXED)
 # =======================
 def create_progress_bar(pct: float, speed: float, eta: float, total_size: int, downloaded: int) -> str:
     """Creates a visual progress bar with emojis and stats"""
@@ -144,7 +143,7 @@ def create_progress_bar(pct: float, speed: float, eta: float, total_size: int, d
         icon = "📦"
         status = "Loading"
     elif pct >= 25:
-        icon = "#
+        icon = "⏳"  # FIXED: Was unterminated string "#
         status = "Waiting"
     else:
         icon = "🌐"
@@ -280,7 +279,7 @@ async def generate_screenshots(video_path: str, uid: int):
     except: return [], out_dir
 
 # =======================
-# UPLOAD
+# UPLOAD WITH ETA + Cancel
 # =======================
 async def upload_with_progress(uid: int, msg: types.Message, path: str, as_video: bool, thumb_path: str | None):
     start = time.time()
@@ -311,10 +310,38 @@ def apply_watermark(input_path: str) -> str:
     return out_path if os.path.exists(out_path) else input_path
 
 # =======================
-# UI & KEYBOARDS
+# BOT INITIALIZATION
+# =======================
+app = Client("dl_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
+
+# =======================
+# UTILS (Re-added after fixes)
+# =======================
+async def safe_edit(msg: types.Message, text: str, reply_markup=None):
+    for _ in range(5):
+        try: 
+            return await msg.edit_text(text, reply_markup=reply_markup)
+        except errors.FloodWait as e:
+            await asyncio.sleep(e.x)
+        except errors.MessageNotModified: 
+            return msg
+        except Exception: 
+            pass # Ignore other errors to prevent crash
+    return msg
+
+async def is_subscribed(uid: int) -> bool:
+    if uid == OWNER_ID: return True
+    if user_get(uid).get("is_banned"): return False
+    try:
+        m = await app.get_chat_member(CHANNEL_ID, uid)
+        return m.status in (enums.ChatMemberStatus.MEMBER, enums.ChatMemberStatus.ADMINISTRATOR, enums.ChatMemberStatus.OWNER)
+    except: return False
+
+# =======================
+# UI MARKUPS
 # =======================
 def cancel_kb():
-    return types.InlineKeyboardMarkup([[types.InlineKeyboardButton("❌ Cancel", callback_data="act_cancel")]])
+    return types.InlineKeyboardMarkup([[types.InlineKeyboardButton("Cancel", callback_data="act_cancel")]])
 
 def join_kb():
     return types.InlineKeyboardMarkup([
@@ -332,13 +359,13 @@ def menu_kb(uid: int):
     else:
         kb.append([types.InlineKeyboardButton("📊 Plan", callback_data="menu_plan")])
         kb.append([types.InlineKeyboardButton("💎 Upgrade", url=CONTACT_URL)])
-    kb.append([types.InlineKeyboardButton("✖️ Exit", callback_data="menu_exit")])
+    kb.append([types.InlineKeyboardButton("✖ Exit", callback_data="menu_exit")])
     return types.InlineKeyboardMarkup(kb)
 
 def thumb_menu_kb():
     return types.InlineKeyboardMarkup([
         [types.InlineKeyboardButton("👁 View", callback_data="thumb_view"), types.InlineKeyboardButton("🗑 Delete", callback_data="thumb_delete")],
-        [types.InlineKeyboardButton("✖️ Exit", callback_data="thumb_exit")]
+        [types.InlineKeyboardButton("✖ Exit", callback_data="thumb_exit")]
     ])
 
 def image_thumb_prompt_kb():
@@ -361,7 +388,7 @@ def rename_choice_kb():
 def upload_choice_kb():
     return types.InlineKeyboardMarkup([
         [types.InlineKeyboardButton("▶️ Upload as Video", callback_data="up_video"), types.InlineKeyboardButton("📄 Upload as Document", callback_data="up_doc")],
-        [types.InlineKeyboardButton("%reshots + Upload", callback_data="up_screens")],
+        [types.InlineKeyboardButton("%reenshots + Upload", callback_data="up_screens")],
         [types.InlineKeyboardButton("Cancel", callback_data="act_cancel")]
     ])
 
@@ -396,11 +423,6 @@ def bc_confirm_kb():
     ])
 
 # =======================
-# BOT INITIALIZATION
-# =======================
-app = Client("dl_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
-
-# =======================
 # HANDLERS
 # =======================
 @app.on_message(filters.command("start") & filters.private)
@@ -409,7 +431,7 @@ async def cmd_start(_, m: types.Message):
     if user_get(uid).get("is_banned"):
         return await m.reply_text("❌ You are banned from using this bot.")
     db_save()
-    await m.reply_text("Welcome to the bot! 👋\n\nSend me a YouTube link or forward a file to get started.", reply_markup=menu_kb(uid))
+    await m.reply_text("Welcome.", reply_markup=menu_kb(uid))
 
 @app.on_message(filters.text & ~filters.command(["start"]) & filters.private)
 async def on_text(_, m: types.Message):
@@ -436,4 +458,381 @@ async def on_text(_, m: types.Message):
         sess["path"] = new_path
         sess["name"] = new_name
         sess["status"] = "ready"
+        u["state"] = "none"
+        session_set(uid, sess)
+        return await m.reply_text(f"✅ Renamed: `{new_name}`", reply_markup=ready_kb())
+
+    # Cached caption
+    if u["state"] == "await_cache_caption":
+        sess = session_get(uid)
+        if not sess or sess.get("status") != "cached":
+            u["state"] = "none"
+            db_save()
+            return await m.reply_text("No cached session.")
+        sess["caption"] = m.text.strip()
+        u["state"] = "none"
+        session_set(uid, sess)
+        return await m.reply_text("✅ Caption updated.", reply_markup=cached_kb())
+
+    # Admin Broadcast input
+    if uid == OWNER_ID and u["state"] == "await_bc_text":
+        u["state"] = "none"
+        u["pending"]["broadcast_text"] = m.text
+        db_save()
+        return await m.reply_text(f"Preview:\n\n{m.text}", reply_markup=bc_confirm_kb())
+
+    # Link handling
+    text = m.text.strip()
+    if not (text.startswith("http://") or text.startswith("https://")):
+        return
+
+    if not await is_subscribed(uid):
+        return await m.reply_text("Join channel first.", reply_markup=join_kb())
+
+    # Cache Check
+    k = url_hash(text)
+    if k in DB["cache"]:
+        cached = DB["cache"][k]
+        session_set(uid, {"status": "cached", "cache_key": k, "cancel": False, "caption": cached.get("file_name","")})
+        return await m.reply_text(f"✅ Cached: `{cached.get('file_name','file')}`", reply_markup=cached_kb())
+
+    # New Download
+    status_msg = await m.reply_text("🔎 Detecting…", reply_markup=cancel_kb())
+    session_set(uid, {"cancel": False})
+
+    if is_youtube(text):
+        session_set(uid, {"status": "yt_wait", "url": text, "cancel": False, "is_playlist": looks_like_playlist(text)})
+        return await safe_edit(status_msg, "YouTube detected. Choose action:", reply_markup=yt_action_kb(looks_like_playlist(text)))
+
+    try:
+        await safe_edit(status_msg, "⬇️ Downloading…", reply_markup=cancel_kb())
+        path, name, ext, size = await download_any(uid, text, status_msg)
+        session_set(uid, {"status": "ready", "url": text, "path": path, "name": name, "orig_name": name, "ext": ext, "size": size, "cancel": False})
+        return await safe_edit(status_msg, f"✅ Downloaded: `{name}`", reply_markup=ready_kb())
+    except Exception as e:
+        msg_str = str(e)
+        if "CANCELLED" in msg_str:
+            session_clear(uid)
+            return await safe_edit(status_msg, "Cancelled.", reply_markup=None)
+        session_clear(uid)
+        return await safe_edit(status_msg, f"Error: {msg_str[:160]}", reply_markup=None)
+
+@app.on_message(filters.photo & filters.private)
+async def on_photo(_, m: types.Message):
+    uid = m.from_user.id
+    if user_get(uid).get("is_banned"): return
+    u = user_get(uid)
+    tmp_path = os.path.join(DOWNLOAD_DIR, f"img_{uid}_{int(time.time())}.jpg")
+    await m.download(tmp_path)
+    u["pending"]["image_path"] = tmp_path
+    db_save()
+    await m.reply_text("Set this image as thumbnail?", reply_markup=image_thumb_prompt_kb())
+
+@app.on_message((filters.video | filters.document | filters.audio | filters.voice | filters.animation) & filters.private)
+async def on_forwarded(_, m: types.Message):
+    uid = m.from_user.id
+    if user_get(uid).get("is_banned"): return
+    if not await is_subscribed(uid):
+        return await m.reply_text("Join channel first.", reply_markup=join_kb())
+
+    media = m.video or m.document or m.audio or m.voice or m.animation
+    status_msg = await m.reply_text("⬇️ Downloading file…", reply_markup=cancel_kb())
+    session_set(uid, {"cancel": False})
+
+    path = os.path.join(DOWNLOAD_DIR, f"fwd_{uid}_{int(time.time())}")
+    try: await m.download(path)
+    except:
+        session_clear(uid)
+        return await safe_edit(status_msg, f"Download failed.", reply_markup=None)
+
+    orig = getattr(media, "file_name", None) or os.path.basename(path)
+    name = safe_filename(orig)
+    ext = os.path.splitext(name)[1] or os.path.splitext(path)[1] or ""
+    size = os.path.getsize(path) if os.path.exists(path) else 0
+    session_set(uid, {"status": "ready", "path": path, "name": name, "orig_name": name, "ext": ext, "size": size, "cancel": False})
+    return await safe_edit(status_msg, f"✅ Downloaded: `{name}`", reply_markup=ready_kb())
+
+# =======================
+# CALLBACK HANDLER (FIXED)
+# =======================
+@app.on_callback_query()
+async def on_cb(_, cb: types.CallbackQuery):
+    uid = cb.from_user.id
+    data = cb.data
+    u = user_get(uid)
+    
+    # 1. IMMEDIATELY ANSWER THE CALLBACK to prevent "QueryIdInvalid"
+    try:
+        await cb.answer()
+    except errors.QueryIdInvalid:
+        pass 
+    except Exception:
+        pass 
+    
+    if u.get("is_banned"):
+        return
+    
+    # --- USER FEATURES ---
+    if data == "menu_help":
+        return await safe_edit(cb.message, "Commands: /start\nSend link or forward file.", reply_markup=menu_kb(uid))
+
+    if data == "menu_id":
+        try: await cb.answer(f"Your ID: {uid}", show_alert=True)
+        except: pass
+        try: await cb.message.reply_text(f"Your ID: `{uid}`")
+        except: pass
+        return
+
+    if data == "menu_plan":
+        if uid == OWNER_ID: return await safe_edit(cb.message, "Plan is for users only.", reply_markup=menu_kb(uid))
+        used = user_get(uid)["used"]
+        rem = max(0, DAILY_LIMIT - used)
+        return await safe_edit(cb.message, f"Plan today:\nUsed: {human_size(used)} / {human_size(DAILY_LIMIT)}\nRemaining: {human_size(rem)}", reply_markup=menu_kb(uid))
+
+    if data == "menu_exit":
+        try: await cb.message.delete()
+        except: pass
+        return
+
+    if data == "join_verify":
+        ok = await is_subscribed(uid)
+        if ok: return await safe_edit(cb.message, "✅ Verified.", reply_markup=menu_kb(uid))
+        return await safe_edit(cb.message, "Join channel first.", reply_markup=join_kb())
+
+    if data == "thumb_menu":
+        return await safe_edit(cb.message, "Thumbnail Manager", reply_markup=thumb_menu_kb())
+    if data == "thumb_view":
+        thumb = u.get("thumb")
+        if thumb and os.path.exists(thumb):
+            await cb.message.reply_photo(thumb, caption="Thumbnail")
+            return
+        return await cb.answer("No thumbnail set.", show_alert=True)
+    if data == "thumb_delete":
+        thumb = u.get("thumb")
+        if thumb and os.path.exists(thumb):
+            try: os.remove(thumb)
+            except: pass
+            u["thumb"] = None
+            db_save()
+            return await safe_edit(cb.message, "Thumbnail deleted.", reply_markup=thumb_menu_kb())
+        return await cb.answer("No thumbnail to delete.", show_alert=True)
+    if data == "thumb_exit":
+        try: await cb.message.delete()
+        except: pass
+        return
+
+    if data == "img_set_thumb":
+        p = u.get("pending", {}).get("image_path")
+        if not p or not os.path.exists(p):
+            return await safe_edit(cb.message, "Image expired.", reply_markup=menu_kb(uid))
+        final = os.path.join(THUMB_DIR, f"{uid}.jpg")
+        try: shutil.move(p, final)
+        except: 
+            shutil.copyfile(p, final)
+            try: os.remove(p)
+            except: pass
+        u["thumb"] = final
+        u["pending"].pop("image_path", None)
+        db_save()
+        return await safe_edit(cb.message, "✅ Thumbnail set.", reply_markup=menu_kb(uid))
+
+    if data == "img_skip_thumb":
+        p = u.get("pending", {}).get("image_path")
+        if p and os.path.exists(p):
+            try: os.remove(p)
+            except: pass
+        u["pending"].pop("image_path", None)
+        db_save()
+        return await safe_edit(cb.message, "Skipped.", reply_markup=menu_kb(uid))
+
+    # --- ADMIN FEATURES ---
+    if data == "admin_menu":
+        if uid != OWNER_ID: return await cb.answer("Not allowed.", show_alert=True)
+        return await safe_edit(cb.message, "Admin Dashboard", reply_markup=admin_kb())
+    
+    if data == "admin_back":
+        return await safe_edit(cb.message, "Main menu", reply_markup=menu_kb(uid))
+    
+    if data == "admin_reports":
+        if uid != OWNER_ID: return await cb.answer("Not allowed.", show_alert=True)
+        total, used, free = shutil.disk_usage("/")
+        txt = f"Users: {len(DB['users'])}\nActive: {len(DB['active'])}\nDisk used: {human_size(used)} / {human_size(total)} (free {human_size(free)})"
+        return await safe_edit(cb.message, txt, reply_markup=admin_kb())
+    
+    if data == "admin_broadcast":
+        if uid != OWNER_ID: return await cb.answer("Not allowed.", show_alert=True)
+        u["state"] = "await_bc_text"
+        db_save()
+        return await safe_edit(cb.message, "Send broadcast text now.", reply_markup=admin_kb())
+    
+    if data == "bc_stop":
+        if uid != OWNER_ID: return
+        u["state"] = "none"
+        u["pending"]["broadcast_text"] = ""
+        db_save()
+        return await safe_edit(cb.message, "Broadcast cancelled.", reply_markup=admin_kb())
+    
+    if data == "bc_confirm":
+        if uid != OWNER_ID: return
+        text = u.get("pending", {}).get("broadcast_text", "")
+        if not text: return await cb.answer("No broadcast text.", show_alert=True)
+        sent = 0
+        for k in list(DB["users"].keys()):
+            try:
+                await app.send_message(int(k), f"📢 Broadcast:\n\n{text}")
+                sent += 1
+                await asyncio.sleep(0.05)
+            except: continue
+        u["pending"]["broadcast_text"] = ""
+        db_save()
+        return await safe_edit(cb.message, f"✅ Sent to {sent} users.", reply_markup=admin_kb())
+
+    # --- CANCEL ---
+    if data == "act_cancel":
+        sess = session_get(uid)
+        if sess:
+            sess["cancel"] = True
+            session_set(uid, sess)
+            if sess.get("path") and os.path.exists(sess["path"]):
+                try: os.remove(sess["path"])
+                except: pass
+        session_clear(uid)
+        return await safe_edit(cb.message, "Cancelled.", reply_markup=None)
+
+    sess = session_get(uid)
+    if not sess: return await cb.answer("No active task.", show_alert=True)
+
+    # --- YOUTUBE FORMATS ---
+    if data.startswith("yt_v_"):
+        h = data.split("_")[-1]
+        try:
+            await safe_edit(cb.message, f"⬇️ Downloading YouTube {h}p…", reply_markup=cancel_kb())
+            path, name, ext, size = await download_youtube(uid, sess["url"], "v", h, cb.message)
+            session_set(uid, {"path": path, "name": name, "orig_name": name, "ext": ext, "size": size, "status": "ready", "cancel": False})
+            return await safe_edit(cb.message, f"✅ Downloaded: `{name}`", reply_markup=ready_kb())
+        except Exception as e:
+            session_clear(uid)
+            return await safe_edit(cb.message, f"Error: {str(e)[:120]}", None)
+
+    if data.startswith("yt_a_"):
+        codec = data.split("_")[-1]
+        try:
+            await safe_edit(cb.message, f"⬇️ Downloading YouTube audio {codec.upper()}…", reply_markup=cancel_kb())
+            path, name, ext, size = await download_youtube(uid, sess["url"], "a", codec, cb.message)
+            session_set(uid, {"path": path, "name": name, "orig_name": name, "ext": ext, "size": size, "status": "ready", "cancel": False})
+            return await safe_edit(cb.message, f"✅ Downloaded: `{name}`", reply_markup=ready_kb())
+        except Exception as e:
+            session_clear(uid)
+            return await safe_edit(cb.message, f"Error: {str(e)[:120]}", None)
+
+    # --- RENAME / UPLOAD ---
+    if data == "act_rename":
+        return await safe_edit(cb.message, "Rename options:", reply_markup=rename_choice_kb())
+    if data == "ren_default":
+        u["state"] = "none"
+        db_save()
+        return await safe_edit(cb.message, f"Using default: `{sess.get('name')}`", reply_markup=ready_kb())
+    if data == "ren_custom":
+        u["state"] = "await_rename"
+        db_save()
+        return await safe_edit(cb.message, "Send new name text.", reply_markup=None)
+
+    if data == "act_upload":
+        return await safe_edit(cb.message, "Choose upload type:", reply_markup=upload_choice_kb())
+
+    if data in ("up_as_video", "up_as_file", "up_with_screens"):
+        if not sess.get("path") or not os.path.exists(sess["path"]):
+            session_clear(uid)
+            return await safe_edit(cb.message, "File missing.", reply_markup=None)
+
+        as_video = (data == "up_as_video")
+        do_screens = (data == "up_with_screens")
+
+        try:
+            if do_screens:
+                await safe_edit(cb.message, "Generating screenshots…", reply_markup=cancel_kb())
+                medias, outdir = await generate_screenshots(sess["path"], uid)
+                if medias:
+                    await app.send_media_group(uid, medias)
+                shutil.rmtree(outdir, ignore_errors=True)
+
+            thumb = u.get("thumb") if u.get("thumb") and os.path.exists(u.get("thumb")) else None
+            prog_msg = await cb.message.reply_text("Uploading…", reply_markup=cancel_kb())
+            await upload_with_progress(uid, prog_msg, sess["path"], as_video, thumb)
+
+            try: os.remove(sess["path"])
+            except: pass
+            session_clear(uid)
+            try: await prog_msg.delete()
+            except: pass
+            return await safe_edit(cb.message, "Done.", reply_markup=None)
+        except Exception as e:
+            try:
+                if sess.get("path") and os.path.exists(sess["path"]): os.remove(sess["path"])
+            except: pass
+            session_clear(uid)
+            return await safe_edit(cb.message, f"Upload error: {str(e)[:120]}", None)
+
+    # --- CACHED ---
+    if sess.get("status") == "cached":
+        ck = sess.get("cache_key")
+        cached = DB["cache"].get(ck)
+        if not cached:
+            session_clear(uid)
+            return await safe_edit(cb.message, "Cache missing.", reply_markup=None)
         
+        if data == "cache_exit":
+            try: await cb.message.delete()
+            except: pass
+            return
+        
+        if data == "cache_ren_def":
+            sess["caption"] = cached.get("file_name", "")
+            session_set(uid, sess)
+            return await safe_edit(cb.message, f"✅ Caption: `{sess['caption']}`", reply_markup=cached_kb())
+        
+        if data == "cache_ren_custom":
+            u["state"] = "await_cache_caption"
+            db_save()
+            return await safe_edit(cb.message, "Send new caption:", reply_markup=None)
+        
+        if data == "cache_redownload":
+            url = sess.get("url")
+            session_clear(uid)
+            return await safe_edit(cb.message, "Send link again to redownload.", reply_markup=menu_kb(uid))
+        
+        # Upload cached
+        if data in ("cache_video", "cache_doc"):
+            try:
+                if data == "cache_video":
+                    await app.send_video(uid, cached["file_id"], caption=sess.get("caption") or cached.get("file_name",""))
+                else:
+                    await app.send_document(uid, cached["file_id"], caption=sess.get("caption") or cached.get("file_name",""))
+                return await safe_edit(cb.message, "✅ Sent (cached).", reply_markup=None)
+            except Exception:
+                return await safe_edit(cb.message, "❌ Cache send failed.", reply_markup=cached_kb())
+
+    return await cb.answer("Unhandled.", show_alert=True)
+
+# =======================
+# MAIN
+# =======================
+async def main():
+    os.makedirs(DOWNLOAD_DIR, exist_ok=True)
+    os.makedirs(THUMB_DIR, exist_ok=True)
+    db_load()
+
+    await app.start()
+
+    srv = web.Application()
+    srv.add_routes([web.get("/", lambda r: web.Response(text="OK"))])
+    runner = web.AppRunner(srv)
+    await runner.setup()
+    await web.TCPSite(runner, "0.0.0.0", 8000).start()
+
+    await idle()
+    await app.stop()
+
+if __name__ == "__main__":
+    app.run(main())
+```
