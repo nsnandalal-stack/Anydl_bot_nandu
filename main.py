@@ -611,4 +611,524 @@ async def on_text(_, m):
     if user.get("state") == "unban" and uid == OWNER_ID:
         user["state"] = "none"
         db_save()
+        try:
+            target_id = int(text)
+            target = user_get(target_id)
+            target["is_banned"] = False
+            db_save()
+            return await m.reply_text(f"✅ User `{target_id}` unbanned!", reply_markup=admin_kb())
+        except:
+            return await m.reply_text("❌ Invalid user ID!", reply_markup=admin_kb())
+    
+    # User info
+    if user.get("state") == "userinfo" and uid == OWNER_ID:
+        user["state"] = "none"
+        db_save()
+        try:
+            target_id = int(text)
+            if str(target_id) in DB["users"]:
+                t = DB["users"][str(target_id)]
+                info = f"""👤 **User Info**
+
+🆔 ID: `{target_id}`
+👑 Pro: {'Yes' if t.get('is_pro') else 'No'}
+🚫 Banned: {'Yes' if t.get('is_banned') else 'No'}
+📦 Used Today: {human_size(t.get('used', 0))}
+📅 Joined: {t.get('joined', 'Unknown')}"""
+                return await m.reply_text(info, reply_markup=admin_kb())
+            else:
+                return await m.reply_text("❌ User not found!", reply_markup=admin_kb())
+        except:
+            return await m.reply_text("❌ Invalid user ID!", reply_markup=admin_kb())
+    
+    # === URL HANDLER ===
+    if not text.startswith("http"):
+        return
+    
+    # Check subscription
+    if not await is_subscribed(uid):
+        return await m.reply_text("⚠️ **Please join our channel first!**", reply_markup=join_kb())
+    
+    status = await m.reply_text("🔍 **Analyzing link...**", reply_markup=cancel_kb())
+    session_set(uid, {"url": text, "cancel": False})
+    
+    # YouTube
+    if is_yt(text):
+        return await safe_edit(status, "🎬 **YouTube Detected!**\n\nChoose format:", yt_kb())
+    
+    # Other links
+    try:
+        await safe_edit(status, "⬇️ **Starting download...**", cancel_kb())
         
+        # Try yt-dlp first
+        try:
+            path, title = await download_yt(uid, text, status, "best")
+        except:
+            path, title = await download_direct(uid, text, status)
+        
+        if not os.path.exists(path):
+            raise Exception("Download failed!")
+        
+        name = os.path.basename(path)
+        size = os.path.getsize(path)
+        
+        session_set(uid, {
+            "url": text, 
+            "path": path, 
+            "name": name, 
+            "ext": get_ext(name), 
+            "size": size, 
+            "cancel": False
+        })
+        
+        await safe_edit(
+            status, 
+            f"✅ **Download Complete!**\n\n📄 **Name:** `{name}`\n📦 **Size:** {human_size(size)}", 
+            upload_kb()
+        )
+        
+    except Exception as e:
+        session_clear(uid)
+        if "CANCELLED" in str(e):
+            await safe_edit(status, "❌ **Cancelled!**", None)
+        else:
+            await safe_edit(status, f"❌ **Error:** {str(e)[:100]}", None)
+
+# =======================
+# FILE HANDLER
+# =======================
+@app.on_message((filters.video | filters.document | filters.audio) & filters.private)
+async def on_file(_, m):
+    uid = m.from_user.id
+    
+    if user_get(uid).get("is_banned"):
+        return
+    
+    if not await is_subscribed(uid):
+        return await m.reply_text("⚠️ Join channel first!", reply_markup=join_kb())
+    
+    media = m.video or m.document or m.audio
+    status = await m.reply_text("⬇️ **Downloading file...**", reply_markup=cancel_kb())
+    session_set(uid, {"cancel": False})
+    
+    try:
+        name = safe_name(getattr(media, "file_name", None) or f"file_{int(time.time())}")
+        path = os.path.join(DOWNLOAD_DIR, name)
+        await m.download(path)
+        
+        size = os.path.getsize(path)
+        session_set(uid, {"path": path, "name": name, "ext": get_ext(name), "size": size, "cancel": False})
+        
+        await safe_edit(
+            status, 
+            f"✅ **Download Complete!**\n\n📄 **Name:** `{name}`\n📦 **Size:** {human_size(size)}", 
+            upload_kb()
+        )
+    except Exception as e:
+        session_clear(uid)
+        await safe_edit(status, f"❌ **Error:** {str(e)[:80]}", None)
+
+# =======================
+# PHOTO HANDLER (Thumbnail)
+# =======================
+@app.on_message(filters.photo & filters.private)
+async def on_photo(_, m):
+    uid = m.from_user.id
+    
+    if user_get(uid).get("is_banned"):
+        return
+    
+    path = os.path.join(THUMB_DIR, f"{uid}.jpg")
+    await m.download(path)
+    user_get(uid)["thumb"] = path
+    db_save()
+    await m.reply_text("✅ **Thumbnail saved!**\n\nThis will be used for all your uploads.")
+
+# =======================
+# CALLBACK HANDLER
+# =======================
+@app.on_callback_query()
+async def on_callback(_, cb):
+    uid = cb.from_user.id
+    data = cb.data
+    user = user_get(uid)
+    sess = session_get(uid)
+    
+    try:
+        await cb.answer()
+    except:
+        pass
+    
+    if user.get("is_banned"):
+        return await cb.answer("❌ You are banned!", show_alert=True)
+    
+    # ============ GENERAL ============
+    
+    if data == "check_join":
+        if await is_subscribed(uid):
+            return await safe_edit(cb.message, "✅ **Verified!** Now send me a link.", main_menu_kb(uid))
+        return await cb.answer("❌ You haven't joined yet!", show_alert=True)
+    
+    if data == "close":
+        try:
+            await cb.message.delete()
+        except:
+            pass
+        return
+    
+    if data == "cancel":
+        if sess:
+            sess["cancel"] = True
+            if sess.get("path") and os.path.exists(sess["path"]):
+                try:
+                    os.remove(sess["path"])
+                except:
+                    pass
+        session_clear(uid)
+        user["state"] = "none"
+        db_save()
+        return await safe_edit(cb.message, "❌ **Cancelled!**", None)
+    
+    if data == "back_main":
+        user["state"] = "none"
+        db_save()
+        return await safe_edit(cb.message, "📋 **Main Menu**", main_menu_kb(uid))
+    
+    # ============ MAIN MENU ============
+    
+    if data == "menu_thumb":
+        return await safe_edit(cb.message, "🖼️ **Thumbnail Settings**\n\nSend a photo to set as thumbnail.", thumb_kb())
+    
+    if data == "menu_stats":
+        used = user.get("used", 0)
+        limit = DAILY_LIMIT
+        remaining = max(0, limit - used)
+        
+        text = f"""📊 **Your Statistics**
+
+📦 **Used Today:** {human_size(used)}
+📉 **Remaining:** {human_size(remaining)}
+📈 **Daily Limit:** {human_size(limit)}
+
+👑 **Pro Status:** {'Yes ✅' if user.get('is_pro') else 'No ❌'}
+📅 **Joined:** {user.get('joined', 'Unknown')}"""
+        
+        return await safe_edit(cb.message, text, main_menu_kb(uid))
+    
+    if data == "menu_help":
+        text = """❓ **How to Use**
+
+1️⃣ Send any video link
+2️⃣ Choose quality (for YouTube)
+3️⃣ Wait for download
+4️⃣ Choose: Rename / File / Video
+5️⃣ Get your file + screenshots!
+
+**Supported Sites:**
+• YouTube, Instagram, Twitter
+• TikTok, Facebook, Reddit
+• And 1000+ more!
+
+**Tips:**
+• Send a photo to set thumbnail
+• Pro users have unlimited downloads"""
+        
+        return await safe_edit(cb.message, text, main_menu_kb(uid))
+    
+    if data == "menu_plan":
+        if user.get("is_pro"):
+            text = "👑 **You are a PRO user!**\n\n✅ Unlimited downloads\n✅ Priority support"
+        else:
+            used = user.get("used", 0)
+            remaining = max(0, DAILY_LIMIT - used)
+            text = f"""📋 **Free Plan**
+
+📦 Daily Limit: {human_size(DAILY_LIMIT)}
+📉 Remaining: {human_size(remaining)}
+
+**Upgrade to PRO:**
+• Unlimited downloads
+• Priority support
+
+Contact admin to upgrade!"""
+        
+        return await safe_edit(cb.message, text, main_menu_kb(uid))
+    
+    # ============ THUMBNAIL ============
+    
+    if data == "thumb_view":
+        thumb = user.get("thumb")
+        if thumb and os.path.exists(thumb):
+            await cb.message.reply_photo(thumb, caption="🖼️ Your current thumbnail")
+        else:
+            await cb.answer("❌ No thumbnail set!", show_alert=True)
+        return
+    
+    if data == "thumb_delete":
+        thumb = user.get("thumb")
+        if thumb and os.path.exists(thumb):
+            try:
+                os.remove(thumb)
+            except:
+                pass
+        user["thumb"] = None
+        db_save()
+        return await safe_edit(cb.message, "✅ **Thumbnail deleted!**", thumb_kb())
+    
+    # ============ ADMIN PANEL ============
+    
+    if data == "admin_panel":
+        if uid != OWNER_ID:
+            return await cb.answer("❌ Not authorized!", show_alert=True)
+        return await safe_edit(cb.message, "⚙️ **Admin Panel**", admin_kb())
+    
+    if data == "admin_stats":
+        if uid != OWNER_ID:
+            return await cb.answer("❌ Not authorized!", show_alert=True)
+        
+        total_users = len(DB["users"])
+        pro_users = len([u for u in DB["users"].values() if u.get("is_pro")])
+        banned = len([u for u in DB["users"].values() if u.get("is_banned")])
+        active = len(DB["sessions"])
+        
+        # Disk usage
+        total, used, free = shutil.disk_usage("/")
+        
+        text = f"""📊 **Bot Statistics**
+
+👥 **Users:** {total_users}
+👑 **Pro Users:** {pro_users}
+🚫 **Banned:** {banned}
+⚡ **Active Sessions:** {active}
+
+💾 **Disk Usage:**
+• Total: {human_size(total)}
+• Used: {human_size(used)}
+• Free: {human_size(free)}
+
+🍪 **Cookies:** {'✅ Found' if get_cookies_path() else '❌ Not found'}"""
+        
+        return await safe_edit(cb.message, text, admin_kb())
+    
+    if data == "admin_broadcast":
+        if uid != OWNER_ID:
+            return await cb.answer("❌ Not authorized!", show_alert=True)
+        user["state"] = "broadcast"
+        db_save()
+        return await safe_edit(cb.message, "📢 **Broadcast**\n\nSend me the message to broadcast:", cancel_kb())
+    
+    if data == "bc_confirm":
+        if uid != OWNER_ID:
+            return
+        
+        bc_text = user.get("bc_text", "")
+        if not bc_text:
+            return await safe_edit(cb.message, "❌ No message to send!", admin_kb())
+        
+        await safe_edit(cb.message, "📢 **Broadcasting...**", None)
+        
+        sent = 0
+        failed = 0
+        for user_id in list(DB["users"].keys()):
+            if DB["users"][user_id].get("is_banned"):
+                continue
+            try:
+                await app.send_message(int(user_id), bc_text)
+                sent += 1
+                await asyncio.sleep(0.1)
+            except:
+                failed += 1
+        
+        user["bc_text"] = ""
+        db_save()
+        
+        return await safe_edit(cb.message, f"✅ **Broadcast Complete!**\n\n📤 Sent: {sent}\n❌ Failed: {failed}", admin_kb())
+    
+    if data == "bc_cancel":
+        user["state"] = "none"
+        user["bc_text"] = ""
+        db_save()
+        return await safe_edit(cb.message, "❌ Broadcast cancelled!", admin_kb())
+    
+    if data == "admin_addpro":
+        if uid != OWNER_ID:
+            return await cb.answer("❌ Not authorized!", show_alert=True)
+        user["state"] = "addpro"
+        db_save()
+        return await safe_edit(cb.message, "👑 **Add Pro User**\n\nSend me the user ID:", cancel_kb())
+    
+    if data == "admin_ban":
+        if uid != OWNER_ID:
+            return await cb.answer("❌ Not authorized!", show_alert=True)
+        user["state"] = "ban"
+        db_save()
+        return await safe_edit(cb.message, "🚫 **Ban User**\n\nSend me the user ID:", cancel_kb())
+    
+    if data == "admin_unban":
+        if uid != OWNER_ID:
+            return await cb.answer("❌ Not authorized!", show_alert=True)
+        user["state"] = "unban"
+        db_save()
+        return await safe_edit(cb.message, "✅ **Unban User**\n\nSend me the user ID:", cancel_kb())
+    
+    if data == "admin_userinfo":
+        if uid != OWNER_ID:
+            return await cb.answer("❌ Not authorized!", show_alert=True)
+        user["state"] = "userinfo"
+        db_save()
+        return await safe_edit(cb.message, "👤 **User Info**\n\nSend me the user ID:", cancel_kb())
+    
+    # ============ YOUTUBE ============
+    
+    if data.startswith("yt_"):
+        if not sess or not sess.get("url"):
+            return await safe_edit(cb.message, "❌ Session expired!", None)
+        
+        format_map = {
+            "yt_video": "best",
+            "yt_audio": "audio",
+            "yt_720": "720",
+            "yt_480": "480",
+            "yt_360": "360"
+        }
+        
+        format_type = format_map.get(data, "best")
+        format_name = "Video" if format_type == "best" else "Audio" if format_type == "audio" else f"{format_type}p"
+        
+        try:
+            await safe_edit(cb.message, f"⬇️ **Downloading {format_name}...**", cancel_kb())
+            path, title = await download_yt(uid, sess["url"], cb.message, format_type)
+            
+            if not os.path.exists(path):
+                raise Exception("Download failed!")
+            
+            name = os.path.basename(path)
+            size = os.path.getsize(path)
+            
+            session_set(uid, {
+                "url": sess["url"], 
+                "path": path, 
+                "name": name, 
+                "ext": get_ext(name), 
+                "size": size, 
+                "cancel": False
+            })
+            
+            await safe_edit(
+                cb.message, 
+                f"✅ **Download Complete!**\n\n📄 **Name:** `{name}`\n📦 **Size:** {human_size(size)}", 
+                upload_kb()
+            )
+        except Exception as e:
+            session_clear(uid)
+            if "CANCELLED" in str(e):
+                await safe_edit(cb.message, "❌ **Cancelled!**", None)
+            else:
+                await safe_edit(cb.message, f"❌ **Error:** {str(e)[:100]}", None)
+        return
+    
+    # ============ RENAME ============
+    
+    if data == "rename":
+        if not sess:
+            return await safe_edit(cb.message, "❌ Session expired!", None)
+        return await safe_edit(cb.message, "✏️ **Rename File**\n\nChoose an option:", rename_kb())
+    
+    if data == "ren_default":
+        if not sess:
+            return await safe_edit(cb.message, "❌ Session expired!", None)
+        return await safe_edit(
+            cb.message, 
+            f"📝 **Using default name:**\n`{sess['name']}`", 
+            upload_kb()
+        )
+    
+    if data == "ren_custom":
+        if not sess:
+            return await safe_edit(cb.message, "❌ Session expired!", None)
+        user["state"] = "rename"
+        db_save()
+        return await safe_edit(
+            cb.message, 
+            f"✏️ **Current name:** `{sess['name']}`\n\nSend me the new name (without extension):", 
+            cancel_kb()
+        )
+    
+    if data == "back_upload":
+        if not sess:
+            return await safe_edit(cb.message, "❌ Session expired!", None)
+        return await safe_edit(
+            cb.message, 
+            f"📄 **Name:** `{sess['name']}`\n📦 **Size:** {human_size(sess.get('size', 0))}", 
+            upload_kb()
+        )
+    
+    # ============ UPLOAD ============
+    
+    if data in ["up_file", "up_video"]:
+        if not sess or not sess.get("path"):
+            return await safe_edit(cb.message, "❌ Session expired!", None)
+        
+        if not os.path.exists(sess["path"]):
+            session_clear(uid)
+            return await safe_edit(cb.message, "❌ File not found!", None)
+        
+        as_video = (data == "up_video")
+        
+        try:
+            await safe_edit(cb.message, "📤 **Uploading...**", cancel_kb())
+            await do_upload(uid, cb.message, sess["path"], sess["name"], as_video)
+            
+            # Cleanup
+            try:
+                os.remove(sess["path"])
+            except:
+                pass
+            session_clear(uid)
+            
+            await safe_edit(cb.message, "✅ **Upload Complete!**", main_menu_kb(uid))
+        except Exception as e:
+            if "CANCELLED" in str(e):
+                await safe_edit(cb.message, "❌ **Cancelled!**", None)
+            else:
+                await safe_edit(cb.message, f"❌ **Error:** {str(e)[:80]}", None)
+
+# =======================
+# HEALTH CHECK & MAIN
+# =======================
+async def health_check(_):
+    return web.Response(text="OK")
+
+async def main():
+    # Create directories
+    os.makedirs(DOWNLOAD_DIR, exist_ok=True)
+    os.makedirs(THUMB_DIR, exist_ok=True)
+    
+    # Load database
+    db_load()
+    
+    # Check cookies
+    cookies = get_cookies_path()
+    if cookies:
+        print(f"✅ Cookies loaded: {cookies}")
+    else:
+        print("⚠️ No cookies found - some videos may not work")
+    
+    # Start bot
+    await app.start()
+    print("✅ Bot started successfully!")
+    
+    # Start health server
+    web_app = web.Application()
+    web_app.add_routes([web.get("/", health_check)])
+    runner = web.AppRunner(web_app)
+    await runner.setup()
+    await web.TCPSite(runner, "0.0.0.0", 8000).start()
+    print("✅ Health server on port 8000")
+    
+    # Keep running
+    await idle()
+    await app.stop()
+
+if __name__ == "__main__":
+    app.run(main())
