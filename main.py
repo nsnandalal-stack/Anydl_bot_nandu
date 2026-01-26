@@ -4,7 +4,6 @@ import time
 import json
 import shutil
 import asyncio
-import hashlib
 import subprocess
 from datetime import date
 from aiohttp import web
@@ -24,19 +23,16 @@ BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 CHANNEL_ID = int(os.getenv("CHANNEL_ID", "0"))
 
 INVITE_LINK = "https://t.me/+eooytvOAwjc0NTI1"
-CONTACT_URL = "https://t.me/poocha"
-
 DOWNLOAD_DIR = "/tmp/downloads"
 THUMB_DIR = "/tmp/thumbnails"
 DB_FILE = "/tmp/bot_db.json"
 COOKIES_FILE = "/tmp/cookies.txt"
-
-DAILY_LIMIT = 5 * 1024 * 1024 * 1024  # 5GB/day
+DAILY_LIMIT = 5 * 1024 * 1024 * 1024
 
 # =======================
 # DATABASE
 # =======================
-DB = {"users": {}, "sessions": {}, "cache": {}}
+DB = {"users": {}, "sessions": {}}
 
 def db_load():
     global DB
@@ -46,9 +42,6 @@ def db_load():
                 DB = json.load(f)
         except:
             pass
-    DB.setdefault("users", {})
-    DB.setdefault("sessions", {})
-    DB.setdefault("cache", {})
 
 def db_save():
     with open(DB_FILE, "w") as f:
@@ -65,7 +58,6 @@ def user_get(uid: int) -> dict:
             "is_pro": (uid == OWNER_ID),
             "is_banned": False
         }
-    # Reset daily quota
     if DB["users"][k].get("reset") != date.today().isoformat():
         DB["users"][k]["reset"] = date.today().isoformat()
         DB["users"][k]["used"] = 0
@@ -88,67 +80,43 @@ def session_clear(uid: int):
 # =======================
 def safe_filename(name: str) -> str:
     name = re.sub(r'[\\/*?:"<>|]', "", name.strip())
-    name = re.sub(r"\s+", " ", name).strip()
     return name[:180] if name else "file"
 
-def get_extension(filename: str) -> str:
-    """Extract extension from filename"""
-    ext = os.path.splitext(filename)[1]
-    return ext if ext else ""
+def get_ext(filename: str) -> str:
+    return os.path.splitext(filename)[1]
 
 def is_youtube(url: str) -> bool:
-    u = url.lower()
-    return "youtube.com" in u or "youtu.be" in u
+    return "youtube.com" in url.lower() or "youtu.be" in url.lower()
 
 def human_size(n) -> str:
     if not n:
         return "0B"
-    for unit in ["B", "KB", "MB", "GB"]:
+    for u in ["B", "KB", "MB", "GB"]:
         if n < 1024:
-            return f"{n:.1f}{unit}"
+            return f"{n:.1f}{u}"
         n /= 1024
     return f"{n:.1f}TB"
 
-def human_time(sec) -> str:
-    if not sec or sec <= 0:
+def human_time(s) -> str:
+    if not s or s <= 0:
         return "—"
-    sec = int(sec)
-    m, s = divmod(sec, 60)
+    s = int(s)
+    m, s = divmod(s, 60)
     h, m = divmod(m, 60)
-    if h:
-        return f"{h}h {m}m"
-    if m:
-        return f"{m}m {s}s"
-    return f"{s}s"
+    return f"{h}h{m}m" if h else f"{m}m{s}s" if m else f"{s}s"
 
-def progress_bar(pct: float, speed: float, eta: float, total: int, done: int) -> str:
-    filled = int(15 * pct / 100)
-    bar = "█" * filled + "░" * (15 - filled)
+def progress_text(pct, speed, eta, total, done, action="Downloading"):
+    bar = "█" * int(15 * pct / 100) + "░" * (15 - int(15 * pct / 100))
     return (
-        f"📥 **Downloading...**\n\n"
-        f"`[{bar}]` {pct:.1f}%\n\n"
-        f"📦 {human_size(done)} / {human_size(total)}\n"
-        f"⚡ {human_size(speed)}/s | ⏱️ {human_time(eta)}"
+        f"{'📥' if 'Down' in action else '📤'} **{action}...**\n\n"
+        f"`[{bar}]` {pct:.1f}%\n"
+        f"📦 {human_size(done)}/{human_size(total)}\n"
+        f"⚡ {human_size(speed)}/s • ⏱️ {human_time(eta)}"
     )
 
-def upload_progress_text(pct: float, speed: float, eta: float, total: int, done: int) -> str:
-    filled = int(15 * pct / 100)
-    bar = "█" * filled + "░" * (15 - filled)
-    return (
-        f"📤 **Uploading...**\n\n"
-        f"`[{bar}]` {pct:.1f}%\n\n"
-        f"📦 {human_size(done)} / {human_size(total)}\n"
-        f"⚡ {human_size(speed)}/s | ⏱️ {human_time(eta)}"
-    )
-
-async def safe_edit(msg, text: str, reply_markup=None):
+async def safe_edit(msg, text, kb=None):
     try:
-        return await msg.edit_text(text, reply_markup=reply_markup)
-    except errors.MessageNotModified:
-        return msg
-    except errors.FloodWait as e:
-        await asyncio.sleep(e.value)
-        return await safe_edit(msg, text, reply_markup)
+        return await msg.edit_text(text, reply_markup=kb)
     except:
         return msg
 
@@ -171,33 +139,28 @@ def join_kb():
     ])
 
 def cancel_kb():
-    return types.InlineKeyboardMarkup([
-        [types.InlineKeyboardButton("❌ Cancel", callback_data="cancel")]
-    ])
+    return types.InlineKeyboardMarkup([[types.InlineKeyboardButton("❌ Cancel", callback_data="cancel")]])
 
-def upload_options_kb():
-    """Main upload options after download"""
+def upload_kb():
     return types.InlineKeyboardMarkup([
         [
             types.InlineKeyboardButton("✏️ Rename", callback_data="rename"),
-            types.InlineKeyboardButton("📄 File", callback_data="upload_file"),
-            types.InlineKeyboardButton("🎬 Video", callback_data="upload_video")
+            types.InlineKeyboardButton("📄 File", callback_data="up_file"),
+            types.InlineKeyboardButton("🎬 Video", callback_data="up_video")
         ],
         [types.InlineKeyboardButton("❌ Cancel", callback_data="cancel")]
     ])
 
-def rename_options_kb():
-    """Rename options"""
+def rename_kb():
     return types.InlineKeyboardMarkup([
         [
-            types.InlineKeyboardButton("📝 Default Name", callback_data="rename_default"),
-            types.InlineKeyboardButton("✏️ Custom Name", callback_data="rename_custom")
+            types.InlineKeyboardButton("📝 Default", callback_data="ren_default"),
+            types.InlineKeyboardButton("✏️ Custom", callback_data="ren_custom")
         ],
-        [types.InlineKeyboardButton("🔙 Back", callback_data="back_to_upload")]
+        [types.InlineKeyboardButton("🔙 Back", callback_data="back")]
     ])
 
-def youtube_quality_kb():
-    """YouTube quality selection"""
+def yt_kb():
     return types.InlineKeyboardMarkup([
         [
             types.InlineKeyboardButton("1080p", callback_data="yt_1080"),
@@ -206,195 +169,407 @@ def youtube_quality_kb():
         ],
         [
             types.InlineKeyboardButton("360p", callback_data="yt_360"),
-            types.InlineKeyboardButton("🎵 MP3", callback_data="yt_mp3"),
-            types.InlineKeyboardButton("🎵 M4A", callback_data="yt_m4a")
+            types.InlineKeyboardButton("🎵 MP3", callback_data="yt_mp3")
         ],
         [types.InlineKeyboardButton("❌ Cancel", callback_data="cancel")]
     ])
 
-def menu_kb(uid: int):
-    kb = [
-        [
-            types.InlineKeyboardButton("📊 My Stats", callback_data="stats"),
-            types.InlineKeyboardButton("🖼️ Thumbnail", callback_data="thumb_menu")
-        ],
+def menu_kb(uid):
+    return types.InlineKeyboardMarkup([
+        [types.InlineKeyboardButton("🖼️ Thumbnail", callback_data="thumb"), types.InlineKeyboardButton("📊 Stats", callback_data="stats")],
         [types.InlineKeyboardButton("❓ Help", callback_data="help")]
-    ]
-    if uid == OWNER_ID:
-        kb.append([types.InlineKeyboardButton("⚙️ Admin", callback_data="admin")])
-    return types.InlineKeyboardMarkup(kb)
+    ])
 
 def thumb_kb():
     return types.InlineKeyboardMarkup([
-        [
-            types.InlineKeyboardButton("👁️ View", callback_data="thumb_view"),
-            types.InlineKeyboardButton("🗑️ Delete", callback_data="thumb_delete")
-        ],
-        [types.InlineKeyboardButton("🔙 Back", callback_data="main_menu")]
+        [types.InlineKeyboardButton("👁️ View", callback_data="thumb_view"), types.InlineKeyboardButton("🗑️ Delete", callback_data="thumb_del")],
+        [types.InlineKeyboardButton("🔙 Back", callback_data="main")]
     ])
 
 # =======================
-# DOWNLOAD FUNCTIONS
+# DOWNLOAD
 # =======================
-def ydl_progress_hook(uid: int, msg, last_update: dict):
+async def download_file(uid: int, url: str, msg, quality=None):
+    last = {"t": 0}
+    
     def hook(d):
-        sess = session_get(uid)
-        if sess and sess.get("cancel"):
+        if session_get(uid) and session_get(uid).get("cancel"):
             raise Exception("CANCELLED")
-        
         if d.get("status") != "downloading":
             return
-        
         now = time.time()
-        if now - last_update.get("t", 0) < 2:
+        if now - last["t"] < 2:
             return
-        
+        last["t"] = now
         total = d.get("total_bytes") or d.get("total_bytes_estimate") or 0
         done = d.get("downloaded_bytes") or 0
         speed = d.get("speed") or 0
         eta = d.get("eta") or 0
         pct = (done / total * 100) if total else 0
-        
-        last_update["t"] = now
-        
         asyncio.get_event_loop().create_task(
-            safe_edit(msg, progress_bar(pct, speed, eta, total, done), cancel_kb())
+            safe_edit(msg, progress_text(pct, speed, eta, total, done), cancel_kb())
         )
-    return hook
-
-async def download_with_ytdlp(uid: int, url: str, msg, quality: str = None):
-    """Download using yt-dlp"""
-    last_update = {"t": 0}
     
     opts = {
         "quiet": True,
-        "no_warnings": True,
         "outtmpl": f"{DOWNLOAD_DIR}/%(title)s.%(ext)s",
         "noplaylist": True,
-        "retries": 5,
-        "socket_timeout": 30,
-        "progress_hooks": [ydl_progress_hook(uid, msg, last_update)],
+        "progress_hooks": [hook],
     }
     
     if os.path.exists(COOKIES_FILE):
         opts["cookiefile"] = COOKIES_FILE
     
-    # Set format based on quality
     if quality:
         if quality in ["1080", "720", "480", "360"]:
-            opts["format"] = f"bestvideo[height<={quality}]+bestaudio/best[height<={quality}]/best"
+            opts["format"] = f"bestvideo[height<={quality}]+bestaudio/best"
         elif quality == "mp3":
             opts["format"] = "bestaudio/best"
             opts["postprocessors"] = [{"key": "FFmpegExtractAudio", "preferredcodec": "mp3"}]
-        elif quality == "m4a":
-            opts["format"] = "bestaudio/best"
-            opts["postprocessors"] = [{"key": "FFmpegExtractAudio", "preferredcodec": "m4a"}]
     
-    with YoutubeDL(opts) as ydl:
-        info = ydl.extract_info(url, download=True)
-        path = ydl.prepare_filename(info)
-        
-        # Handle audio conversion path change
-        if quality in ["mp3", "m4a"]:
-            path = os.path.splitext(path)[0] + f".{quality}"
-        
-        title = info.get("title", "video")
-        return path, title
+    try:
+        with YoutubeDL(opts) as ydl:
+            info = ydl.extract_info(url, download=True)
+            path = ydl.prepare_filename(info)
+            if quality == "mp3":
+                path = os.path.splitext(path)[0] + ".mp3"
+            return path, info.get("title", "file")
+    except Exception as e:
+        if "CANCELLED" in str(e):
+            raise
+        return await download_direct(uid, url, msg)
 
 async def download_direct(uid: int, url: str, msg):
-    """Download direct links"""
     r = requests.get(url, stream=True, timeout=30)
     r.raise_for_status()
-    
-    # Get filename from URL or headers
-    filename = url.split("/")[-1].split("?")[0] or "file"
-    if "content-disposition" in r.headers:
-        cd = r.headers["content-disposition"]
-        if "filename=" in cd:
-            filename = cd.split("filename=")[1].strip('"\'')
-    
-    filename = safe_filename(filename)
-    path = os.path.join(DOWNLOAD_DIR, filename)
+    name = safe_filename(url.split("/")[-1].split("?")[0] or "file")
+    path = os.path.join(DOWNLOAD_DIR, name)
     total = int(r.headers.get("content-length", 0))
     done = 0
     start = time.time()
-    last_update = 0
+    last = 0
     
     with open(path, "wb") as f:
-        for chunk in r.iter_content(chunk_size=256 * 1024):
-            sess = session_get(uid)
-            if sess and sess.get("cancel"):
+        for chunk in r.iter_content(256 * 1024):
+            if session_get(uid) and session_get(uid).get("cancel"):
                 raise Exception("CANCELLED")
-            
             if chunk:
                 f.write(chunk)
                 done += len(chunk)
-                
                 now = time.time()
-                if now - last_update >= 2:
-                    last_update = now
+                if now - last >= 2:
+                    last = now
                     speed = done / max(1, now - start)
                     eta = (total - done) / speed if speed and total else 0
                     pct = (done / total * 100) if total else 0
-                    await safe_edit(msg, progress_bar(pct, speed, eta, total, done), cancel_kb())
+                    await safe_edit(msg, progress_text(pct, speed, eta, total, done), cancel_kb())
     
-    return path, os.path.splitext(filename)[0]
+    return path, os.path.splitext(name)[0]
 
 # =======================
-# SCREENSHOT GENERATOR
+# SCREENSHOTS
 # =======================
-async def generate_screenshots(video_path: str, count: int = 5):
-    """Generate screenshots from video"""
+async def make_screenshots(path: str, count: int = 5):
     screens = []
-    out_dir = os.path.join(DOWNLOAD_DIR, f"screens_{int(time.time())}")
+    out_dir = os.path.join(DOWNLOAD_DIR, f"ss_{int(time.time())}")
     os.makedirs(out_dir, exist_ok=True)
     
     try:
-        # Get video duration
-        cmd = f'ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "{video_path}"'
-        result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
-        duration = float(result.stdout.strip() or "0")
-        
-        if duration <= 0:
+        cmd = f'ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "{path}"'
+        dur = float(subprocess.check_output(cmd, shell=True).decode().strip() or "0")
+        if dur <= 0:
             return [], out_dir
         
-        # Generate screenshots at intervals
-        interval = duration / (count + 1)
-        
+        interval = dur / (count + 1)
         for i in range(1, count + 1):
-            timestamp = interval * i
-            output_path = os.path.join(out_dir, f"screen_{i}.jpg")
-            
-            cmd = [
-                "ffmpeg", "-ss", str(timestamp),
-                "-i", video_path,
-                "-vframes", "1",
-                "-q:v", "2",
-                "-y", output_path
-            ]
-            subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            
-            if os.path.exists(output_path):
-                screens.append(output_path)
-        
+            out = os.path.join(out_dir, f"{i}.jpg")
+            subprocess.run(
+                ["ffmpeg", "-ss", str(interval * i), "-i", path, "-vframes", "1", "-q:v", "2", "-y", out],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+            )
+            if os.path.exists(out):
+                screens.append(out)
         return screens, out_dir
-    except Exception as e:
-        print(f"Screenshot error: {e}")
+    except:
         return [], out_dir
 
 # =======================
-# UPLOAD FUNCTION
+# UPLOAD
 # =======================
-async def upload_file(uid: int, msg, path: str, filename: str, as_video: bool):
-    """Upload file with progress"""
-    start = time.time()
-    last_update = {"t": 0}
-    file_size = os.path.getsize(path)
-    
-    # Get user thumbnail
+async def upload(uid: int, msg, path: str, name: str, as_video: bool):
     user = user_get(uid)
     thumb = user.get("thumb")
     if thumb and not os.path.exists(thumb):
         thumb = None
     
-    async 
+    start = time.time()
+    last = {"t": 0}
+    size = os.path.getsize(path)
+    
+    async def prog(done, total):
+        if session_get(uid) and session_get(uid).get("cancel"):
+            raise Exception("CANCELLED")
+        now = time.time()
+        if now - last["t"] < 2:
+            return
+        last["t"] = now
+        speed = done / max(1, now - start)
+        eta = (total - done) / speed if speed else 0
+        pct = (done / total * 100) if total else 0
+        await safe_edit(msg, progress_text(pct, speed, eta, total, done, "Uploading"), cancel_kb())
+    
+    if as_video:
+        await app.send_video(uid, path, caption=f"🎬 `{name}`", file_name=name, supports_streaming=True, thumb=thumb, progress=prog)
+        await safe_edit(msg, "📸 Generating screenshots...", None)
+        screens, ss_dir = await make_screenshots(path, 5)
+        if screens:
+            media = [types.InputMediaPhoto(s) for s in screens]
+            await app.send_media_group(uid, media)
+        shutil.rmtree(ss_dir, ignore_errors=True)
+    else:
+        await app.send_document(uid, path, caption=f"📄 `{name}`", file_name=name, thumb=thumb, progress=prog)
+    
+    if uid != OWNER_ID and not user.get("is_pro"):
+        user["used"] += size
+        db_save()
+
+# =======================
+# BOT
+# =======================
+app = Client("bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
+
+@app.on_message(filters.command("start") & filters.private)
+async def cmd_start(_, m):
+    user_get(m.from_user.id)
+    db_save()
+    await m.reply_text(
+        f"👋 **Hi {m.from_user.first_name}!**\n\nSend me any link to download.",
+        reply_markup=menu_kb(m.from_user.id)
+    )
+
+@app.on_message(filters.text & filters.private & ~filters.command(["start"]))
+async def on_text(_, m):
+    uid = m.from_user.id
+    user = user_get(uid)
+    text = m.text.strip()
+    
+    if user.get("is_banned"):
+        return
+    
+    # Custom rename input
+    if user.get("state") == "awaiting_rename":
+        sess = session_get(uid)
+        if not sess:
+            user["state"] = "none"
+            db_save()
+            return await m.reply_text("❌ Session expired.")
+        
+        new_name = safe_filename(text) + sess.get("ext", "")
+        sess["name"] = new_name
+        session_set(uid, sess)
+        user["state"] = "none"
+        db_save()
+        
+        return await m.reply_text(f"✅ Renamed to: `{new_name}`\n\nChoose format:", reply_markup=upload_kb())
+    
+    # Check URL
+    if not text.startswith("http"):
+        return
+    
+    if not await is_subscribed(uid):
+        return await m.reply_text("⚠️ Join channel first!", reply_markup=join_kb())
+    
+    status = await m.reply_text("🔍 Analyzing...", reply_markup=cancel_kb())
+    session_set(uid, {"url": text, "cancel": False})
+    
+    if is_youtube(text):
+        return await safe_edit(status, "🎬 **YouTube detected!**\n\nChoose quality:", yt_kb())
+    
+    try:
+        await safe_edit(status, "⬇️ Downloading...", cancel_kb())
+        path, title = await download_file(uid, text, status)
+        
+        name = os.path.basename(path)
+        ext = get_ext(name)
+        size = os.path.getsize(path)
+        
+        session_set(uid, {"url": text, "path": path, "name": name, "ext": ext, "size": size, "cancel": False})
+        
+        await safe_edit(status, f"✅ **Downloaded!**\n\n📄 `{name}`\n📦 {human_size(size)}", upload_kb())
+    except Exception as e:
+        session_clear(uid)
+        msg = "❌ Cancelled." if "CANCELLED" in str(e) else f"❌ Error: {str(e)[:80]}"
+        await safe_edit(status, msg, None)
+
+@app.on_message((filters.video | filters.document | filters.audio) & filters.private)
+async def on_file(_, m):
+    uid = m.from_user.id
+    if not await is_subscribed(uid):
+        return await m.reply_text("⚠️ Join channel first!", reply_markup=join_kb())
+    
+    media = m.video or m.document or m.audio
+    status = await m.reply_text("⬇️ Downloading...", reply_markup=cancel_kb())
+    session_set(uid, {"cancel": False})
+    
+    try:
+        name = safe_filename(getattr(media, "file_name", None) or f"file_{int(time.time())}")
+        path = os.path.join(DOWNLOAD_DIR, name)
+        await m.download(path)
+        
+        ext = get_ext(name)
+        size = os.path.getsize(path)
+        session_set(uid, {"path": path, "name": name, "ext": ext, "size": size, "cancel": False})
+        
+        await safe_edit(status, f"✅ **Downloaded!**\n\n📄 `{name}`\n📦 {human_size(size)}", upload_kb())
+    except Exception as e:
+        session_clear(uid)
+        await safe_edit(status, f"❌ Error: {str(e)[:80]}", None)
+
+@app.on_message(filters.photo & filters.private)
+async def on_photo(_, m):
+    uid = m.from_user.id
+    path = os.path.join(THUMB_DIR, f"{uid}.jpg")
+    await m.download(path)
+    user_get(uid)["thumb"] = path
+    db_save()
+    await m.reply_text("✅ Thumbnail saved!")
+
+@app.on_callback_query()
+async def on_cb(_, cb):
+    uid = cb.from_user.id
+    data = cb.data
+    user = user_get(uid)
+    sess = session_get(uid)
+    
+    await cb.answer()
+    
+    # Join check
+    if data == "check_join":
+        if await is_subscribed(uid):
+            return await safe_edit(cb.message, "✅ Verified! Send a link.", menu_kb(uid))
+        return await safe_edit(cb.message, "❌ Not joined yet!", join_kb())
+    
+    # Menu
+    if data == "main":
+        return await safe_edit(cb.message, "🏠 Main Menu", menu_kb(uid))
+    
+    if data == "help":
+        return await safe_edit(cb.message, "**How to use:**\n\n1. Send link\n2. Choose Rename/File/Video\n3. Get file + screenshots!", menu_kb(uid))
+    
+    if data == "stats":
+        used = user.get("used", 0)
+        return await safe_edit(cb.message, f"📊 Used: {human_size(used)} / {human_size(DAILY_LIMIT)}", menu_kb(uid))
+    
+    if data == "thumb":
+        return await safe_edit(cb.message, "🖼️ Thumbnail", thumb_kb())
+    
+    if data == "thumb_view":
+        t = user.get("thumb")
+        if t and os.path.exists(t):
+            await cb.message.reply_photo(t)
+        else:
+            await cb.answer("No thumbnail!", show_alert=True)
+        return
+    
+    if data == "thumb_del":
+        t = user.get("thumb")
+        if t and os.path.exists(t):
+            os.remove(t)
+        user["thumb"] = None
+        db_save()
+        return await safe_edit(cb.message, "✅ Deleted!", thumb_kb())
+    
+    # Cancel
+    if data == "cancel":
+        if sess:
+            sess["cancel"] = True
+            if sess.get("path") and os.path.exists(sess["path"]):
+                try:
+                    os.remove(sess["path"])
+                except:
+                    pass
+        session_clear(uid)
+        return await safe_edit(cb.message, "❌ Cancelled.", None)
+    
+    # YouTube
+    if data.startswith("yt_"):
+        q = data[3:]
+        if not sess or not sess.get("url"):
+            return await safe_edit(cb.message, "❌ Session expired.", None)
+        
+        try:
+            await safe_edit(cb.message, f"⬇️ Downloading {q}...", cancel_kb())
+            path, title = await download_file(uid, sess["url"], cb.message, q)
+            
+            name = os.path.basename(path)
+            ext = get_ext(name)
+            size = os.path.getsize(path)
+            
+            session_set(uid, {"url": sess["url"], "path": path, "name": name, "ext": ext, "size": size, "cancel": False})
+            await safe_edit(cb.message, f"✅ **Downloaded!**\n\n📄 `{name}`\n📦 {human_size(size)}", upload_kb())
+        except Exception as e:
+            session_clear(uid)
+            msg = "❌ Cancelled." if "CANCELLED" in str(e) else f"❌ Error: {str(e)[:80]}"
+            await safe_edit(cb.message, msg, None)
+        return
+    
+    # Rename
+    if data == "rename":
+        return await safe_edit(cb.message, "✏️ **Rename:**", rename_kb())
+    
+    if data == "ren_default":
+        return await safe_edit(cb.message, f"📝 Using: `{sess['name']}`\n\nChoose format:", upload_kb())
+    
+    if data == "ren_custom":
+        user["state"] = "awaiting_rename"
+        db_save()
+        return await safe_edit(cb.message, f"📝 Current: `{sess['name']}`\n\nSend new name (without extension):", cancel_kb())
+    
+    if data == "back":
+        return await safe_edit(cb.message, f"📄 `{sess['name']}`\n📦 {human_size(sess.get('size', 0))}", upload_kb())
+    
+    # Upload
+    if data in ["up_file", "up_video"]:
+        if not sess or not sess.get("path") or not os.path.exists(sess["path"]):
+            return await safe_edit(cb.message, "❌ File missing.", None)
+        
+        try:
+            await safe_edit(cb.message, "📤 Uploading...", cancel_kb())
+            await upload(uid, cb.message, sess["path"], sess["name"], data == "up_video")
+            
+            try:
+                os.remove(sess["path"])
+            except:
+                pass
+            session_clear(uid)
+            
+            await safe_edit(cb.message, "✅ **Done!**", menu_kb(uid))
+        except Exception as e:
+            msg = "❌ Cancelled." if "CANCELLED" in str(e) else f"❌ Error: {str(e)[:80]}"
+            await safe_edit(cb.message, msg, None)
+
+# =======================
+# MAIN
+# =======================
+async def health(_):
+    return web.Response(text="OK")
+
+async def main():
+    os.makedirs(DOWNLOAD_DIR, exist_ok=True)
+    os.makedirs(THUMB_DIR, exist_ok=True)
+    db_load()
+    
+    await app.start()
+    print("✅ Bot started!")
+    
+    srv = web.Application()
+    srv.add_routes([web.get("/", health)])
+    runner = web.AppRunner(srv)
+    await runner.setup()
+    await web.TCPSite(runner, "0.0.0.0", 8000).start()
+    
+    await idle()
+    await app.stop()
+
+if __name__ == "__main__":
+    app.run(main())
