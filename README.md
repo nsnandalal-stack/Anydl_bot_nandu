@@ -7,7 +7,7 @@ A professional, minimal, and production-ready media downloader bot built with Py
 - **YouTube Specialized:** Choose between Video and Audio (MP3) with file size previews.
 - **Admin Dashboard:** Monitor disk usage, active sessions, and user stats via `/admin`.
 - **Force Subscription:** Users must join your channel to use the bot.
-- **Usage Limits:** 15GB daily limit for free users (configurable).
+- **Usage Limits:** 5GB daily limit for free users (configurable).
 - **Safety First:** Built-in NSFW keyword filter to prevent server abuse.
 - **Auto-Cleanup:** Automatically deletes files from the server after 1 hour to save disk space.
 - **Owner Monitoring:** Sends real-time notifications to the owner when users download files.
