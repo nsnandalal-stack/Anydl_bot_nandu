@@ -1,223 +1,687 @@
-import os, re, shutil, time, asyncio, random, subprocess, json
+import os
+import re
+import time
+import json
+import math
+import shutil
+import asyncio
+import subprocess
 from datetime import datetime
-from pyrogram import Client, filters, types, enums, idle, errors
-from yt_dlp import YoutubeDL
 from aiohttp import web
 
-# --- MASTER CONFIG ---
+from pyrogram import Client, filters, types, enums, idle, errors
+from yt_dlp import YoutubeDL
+
+# =======================
+# Config
+# =======================
 OWNER_ID = 519459195
-API_ID = int(os.getenv("API_ID", 0))
+API_ID = int(os.getenv("API_ID", "0"))
 API_HASH = os.getenv("API_HASH", "")
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
-CHANNEL_ID = int(os.getenv("CHANNEL_ID", 0))
+CHANNEL_ID = int(os.getenv("CHANNEL_ID", "0"))
+
 INVITE_LINK = "https://t.me/+eooytvOAwjc0NTI1"
 CONTACT_URL = "https://t.me/poocha"
+
 DOWNLOAD_DIR = "/app/downloads"
 THUMB_DIR = "/app/thumbnails"
 DB_FILE = "/app/database.json"
 COOKIES_FILE = "/app/cookies.txt"
 
-# --- DB ENGINE ---
-DB = {"users": {}, "active": {}, "admins": [519459195]}
+# =======================
+# Persistence (simple JSON)
+# =======================
+DB = {
+    "users": {},   # uid(str): {"thumb": str|None, "state": "none|await_thumb|await_rename_name|await_bc_text", "pending": {...}}
+    "active": {},  # uid(str): session dict
+}
 
-def save_db():
-    with open(DB_FILE, "w") as f: json.dump(DB, f, default=str)
-
-def load_db():
+def db_load():
     global DB
     if os.path.exists(DB_FILE):
         try:
-            with open(DB_FILE, "r") as f:
+            with open(DB_FILE, "r", encoding="utf-8") as f:
                 DB = json.load(f)
-                if "active" not in DB: DB["active"] = {}
-                if "admins" not in DB: DB["admins"] = [OWNER_ID]
-        except: pass
+        except Exception:
+            pass
+    DB.setdefault("users", {})
+    DB.setdefault("active", {})
 
-def get_user(uid):
-    uid_s = str(uid)
-    if uid_s not in DB["users"]:
-        DB["users"][uid_s] = {"thumb": None, "state": "none"}
-    return DB["users"][uid_s]
+def db_save():
+    tmp = DB_FILE + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(DB, f, ensure_ascii=False)
+    os.replace(tmp, DB_FILE)
 
-app = Client("dl_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN, sleep_threshold=120)
+def ukey(uid: int) -> str:
+    return str(uid)
 
-# --- UTILS ---
-async def safe_edit(msg, text, reply_markup=None):
-    try: return await msg.edit(text, reply_markup=reply_markup)
-    except: return msg
+def user_get(uid: int) -> dict:
+    k = ukey(uid)
+    if k not in DB["users"]:
+        DB["users"][k] = {"thumb": None, "state": "none", "pending": {}}
+    return DB["users"][k]
 
-async def is_subscribed(uid):
-    if uid == OWNER_ID: return True
+def session_get(uid: int) -> dict | None:
+    return DB["active"].get(ukey(uid))
+
+def session_set(uid: int, s: dict):
+    DB["active"][ukey(uid)] = s
+    db_save()
+
+def session_clear(uid: int):
+    DB["active"].pop(ukey(uid), None)
+    u = user_get(uid)
+    u["state"] = "none"
+    u["pending"] = {}
+    db_save()
+
+# =======================
+# Helpers
+# =======================
+def is_youtube(url: str) -> bool:
+    u = url.lower()
+    return "youtube.com" in u or "youtu.be" in u
+
+def safe_filename(name: str) -> str:
+    name = name.strip().replace("\n", " ")
+    name = re.sub(r'[\\/*?:"<>|]', "", name)
+    name = re.sub(r"\s+", " ", name).strip()
+    return name[:180] if name else "file"
+
+def file_ext_from_path(path: str) -> str:
+    ext = os.path.splitext(path)[1]
+    return ext if ext else ""
+
+def human_size(n: int | float | None) -> str:
+    if not n:
+        return "0B"
+    n = float(n)
+    for unit in ["B", "KB", "MB", "GB", "TB"]:
+        if n < 1024:
+            return f"{n:.1f}{unit}"
+        n /= 1024
+    return f"{n:.1f}PB"
+
+def human_time(seconds: float | None) -> str:
+    if seconds is None or seconds <= 0 or math.isinf(seconds):
+        return "—"
+    seconds = int(seconds)
+    m, s = divmod(seconds, 60)
+    h, m = divmod(m, 60)
+    if h:
+        return f"{h}h {m}m"
+    if m:
+        return f"{m}m {s}s"
+    return f"{s}s"
+
+async def safe_edit(msg: types.Message, text: str, reply_markup=None):
+    try:
+        return await msg.edit_text(text, reply_markup=reply_markup)
+    except errors.MessageNotModified:
+        return msg
+    except Exception:
+        return msg
+
+async def is_subscribed(uid: int) -> bool:
+    if uid == OWNER_ID:
+        return True
     try:
         m = await app.get_chat_member(CHANNEL_ID, uid)
-        return m.status in [enums.ChatMemberStatus.MEMBER, enums.ChatMemberStatus.ADMINISTRATOR, enums.ChatMemberStatus.OWNER]
-    except: return False
+        return m.status in (
+            enums.ChatMemberStatus.MEMBER,
+            enums.ChatMemberStatus.ADMINISTRATOR,
+            enums.ChatMemberStatus.OWNER,
+        )
+    except errors.UserNotParticipant:
+        return False
+    except Exception:
+        # if bot can't check, treat as not subscribed (no loop, just consistent)
+        return False
 
-async def take_screenshots(video_path, uid):
-    out_dir = os.path.join(DOWNLOAD_DIR, f"sc_{uid}")
-    if not os.path.exists(out_dir): os.makedirs(out_dir)
+def join_markup():
+    return types.InlineKeyboardMarkup([
+        [types.InlineKeyboardButton("Join Channel", url=INVITE_LINK)],
+        [types.InlineKeyboardButton("Verify", callback_data="join_verify")]
+    ])
+
+def main_menu_markup(uid: int):
+    kb = [
+        [
+            types.InlineKeyboardButton("Help", callback_data="menu_help"),
+            types.InlineKeyboardButton("My ID", callback_data="menu_id"),
+        ],
+        [types.InlineKeyboardButton("Thumbnail Manager", callback_data="thumb_menu")],
+    ]
+    if uid == OWNER_ID:
+        kb.append([types.InlineKeyboardButton("Admin Dashboard", callback_data="admin_menu")])
+    else:
+        kb.append([types.InlineKeyboardButton("Upgrade", url=CONTACT_URL)])
+    kb.append([types.InlineKeyboardButton("Exit", callback_data="menu_exit")])
+    return types.InlineKeyboardMarkup(kb)
+
+def thumb_menu_markup():
+    # STRICT: ONLY View/Delete
+    return types.InlineKeyboardMarkup([
+        [
+            types.InlineKeyboardButton("View Thumbnail", callback_data="thumb_view"),
+            types.InlineKeyboardButton("Delete Thumbnail", callback_data="thumb_delete"),
+        ]
+    ])
+
+def ready_markup():
+    return types.InlineKeyboardMarkup([
+        [
+            types.InlineKeyboardButton("Rename", callback_data="act_rename"),
+            types.InlineKeyboardButton("Upload", callback_data="act_upload"),
+        ],
+        [types.InlineKeyboardButton("Cancel", callback_data="act_cancel")],
+    ])
+
+def rename_choice_markup():
+    return types.InlineKeyboardMarkup([
+        [
+            types.InlineKeyboardButton("Use Default Name", callback_data="ren_default"),
+            types.InlineKeyboardButton("Enter New Name", callback_data="ren_custom"),
+        ]
+    ])
+
+def upload_choice_markup():
+    return types.InlineKeyboardMarkup([
+        [
+            types.InlineKeyboardButton("Video", callback_data="up_as_video"),
+            types.InlineKeyboardButton("File", callback_data="up_as_file"),
+        ],
+        [types.InlineKeyboardButton("Upload + Screenshots", callback_data="up_with_screens")],
+        [types.InlineKeyboardButton("Cancel", callback_data="act_cancel")]
+    ])
+
+def youtube_format_markup():
+    return types.InlineKeyboardMarkup([
+        [types.InlineKeyboardButton("1080p", callback_data="yt_v_1080"),
+         types.InlineKeyboardButton("720p", callback_data="yt_v_720"),
+         types.InlineKeyboardButton("480p", callback_data="yt_v_480"),
+         types.InlineKeyboardButton("360p", callback_data="yt_v_360")],
+        [types.InlineKeyboardButton("MP3", callback_data="yt_a_mp3"),
+         types.InlineKeyboardButton("M4A", callback_data="yt_a_m4a"),
+         types.InlineKeyboardButton("AAC", callback_data="yt_a_aac")],
+        [types.InlineKeyboardButton("Cancel", callback_data="act_cancel")]
+    ])
+
+def admin_menu_markup():
+    return types.InlineKeyboardMarkup([
+        [types.InlineKeyboardButton("Reports", callback_data="admin_reports"),
+         types.InlineKeyboardButton("Broadcast", callback_data="admin_broadcast")],
+        [types.InlineKeyboardButton("Back", callback_data="admin_back")]
+    ])
+
+def broadcast_confirm_markup():
+    return types.InlineKeyboardMarkup([
+        [types.InlineKeyboardButton("Confirm", callback_data="bc_confirm"),
+         types.InlineKeyboardButton("Stop", callback_data="bc_stop")]
+    ])
+
+# =======================
+# Media functions
+# =======================
+async def generate_screenshots(video_path: str, uid: int):
+    out_dir = os.path.join(DOWNLOAD_DIR, f"screens_{uid}")
+    os.makedirs(out_dir, exist_ok=True)
     try:
         cmd = f'ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "{video_path}"'
-        duration = float(subprocess.check_output(cmd, shell=True))
-        screens = []
+        dur = float(subprocess.check_output(cmd, shell=True).decode().strip() or "0")
+        if dur <= 0:
+            return [], out_dir
+        medias = []
         for i in range(1, 11):
-            t = (duration / 11) * i
-            p = os.path.join(out_dir, f"{i}.jpg")
-            subprocess.call(['ffmpeg', '-ss', str(t), '-i', video_path, '-vframes', '1', p, '-y'], stderr=subprocess.DEVNULL)
-            if os.path.exists(p): screens.append(types.InputMediaPhoto(p))
-        return screens
-    except: return []
+            t = (dur / 11) * i
+            out = os.path.join(out_dir, f"{i}.jpg")
+            subprocess.call(
+                ["ffmpeg", "-ss", str(t), "-i", video_path, "-vframes", "1", "-q:v", "2", out, "-y"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            if os.path.exists(out):
+                medias.append(types.InputMediaPhoto(out))
+        return medias, out_dir
+    except Exception:
+        return [], out_dir
 
-# --- KEYBOARDS ---
-def get_main_btns(uid):
-    btns = [[types.InlineKeyboardButton("❓ Help", callback_data="cb_help"), types.InlineKeyboardButton("🆔 My ID", callback_data="cb_id")],
-            [types.InlineKeyboardButton("🖼 Thumbnail Manager", callback_data="cb_thumb_mgr")]]
-    if uid == OWNER_ID: btns.append([types.InlineKeyboardButton("⚙️ Admin Panel", callback_data="cb_admin_main")])
-    btns.append([types.InlineKeyboardButton("🚪 Exit", callback_data="cb_exit")])
-    return types.InlineKeyboardMarkup(btns)
+async def upload_with_progress(chat_id: int, msg: types.Message, path: str, as_video: bool, thumb_path: str | None):
+    size = os.path.getsize(path) if os.path.exists(path) else 0
+    start = time.time()
+    last = {"t": 0.0}
 
-def get_ready_menu():
-    return types.InlineKeyboardMarkup([
-        [types.InlineKeyboardButton("Rename ✏️", callback_data="cb_ren_start"), types.InlineKeyboardButton("Upload ⬆️", callback_data="cb_up_start")],
-        [types.InlineKeyboardButton("Cancel ❌", callback_data="cb_cancel")]
-    ])
+    async def prog(cur, tot):
+        # cancel check
+        s = session_get(chat_id)
+        if s and s.get("cancel"):
+            raise Exception("CANCELLED")
+        now = time.time()
+        if now - last["t"] < 3:
+            return
+        last["t"] = now
+        speed = cur / max(1, now - start)
+        eta = (tot - cur) / speed if speed > 0 and tot else None
+        await safe_edit(msg, f"Uploading… {human_size(cur)}/{human_size(tot)} | ETA {human_time(eta)}",
+                        reply_markup=types.InlineKeyboardMarkup([[types.InlineKeyboardButton("Cancel", callback_data="act_cancel")]]))
 
-def get_rename_options():
-    return types.InlineKeyboardMarkup([
-        [types.InlineKeyboardButton("✅ Use Default", callback_data="cb_ren_def"), types.InlineKeyboardButton("✏️ Enter New Name", callback_data="cb_ren_cus")],
-        [types.InlineKeyboardButton("🔙 Back", callback_data="cb_ready_back")]
-    ])
+    if as_video:
+        return await app.send_video(
+            chat_id=chat_id,
+            video=path,
+            supports_streaming=True,
+            thumb=thumb_path if thumb_path and os.path.exists(thumb_path) else None,
+            progress=prog,
+        )
+    return await app.send_document(
+        chat_id=chat_id,
+        document=path,
+        thumb=thumb_path if thumb_path and os.path.exists(thumb_path) else None,
+        progress=prog,
+    )
 
-def get_upload_options():
-    return types.InlineKeyboardMarkup([
-        [types.InlineKeyboardButton("Video 🎥", callback_data="cb_up_vid"), types.InlineKeyboardButton("File 📄", callback_data="cb_up_fil")],
-        [types.InlineKeyboardButton("Upload + 📸", callback_data="cb_up_scr")],
-        [types.InlineKeyboardButton("🔙 Back", callback_data="cb_ready_back")]
-    ])
+def ydl_base_opts():
+    opts = {
+        "quiet": True,
+        "no_warnings": True,
+        "outtmpl": f"{DOWNLOAD_DIR}/%(title)s.%(ext)s",
+    }
+    if os.path.exists(COOKIES_FILE):
+        opts["cookiefile"] = COOKIES_FILE
+    return opts
 
-# --- HANDLERS ---
+async def download_generic(url: str) -> tuple[str, str]:
+    # returns (path, name)
+    opts = ydl_base_opts()
+    with YoutubeDL(opts) as ydl:
+        info = ydl.extract_info(url, download=True)
+        path = ydl.prepare_filename(info)
+        name = os.path.basename(path)
+        return path, name
+
+async def download_youtube(url: str, kind: str, value: str) -> tuple[str, str]:
+    # kind: "v" or "a"
+    opts = ydl_base_opts()
+    if kind == "v":
+        h = int(value)
+        opts["format"] = f"bestvideo[height<={h}]+bestaudio/best"
+    else:
+        # audio
+        opts["format"] = "bestaudio/best"
+        if value in ("mp3", "m4a", "aac"):
+            opts["postprocessors"] = [{"key": "FFmpegExtractAudio", "preferredcodec": value}]
+    with YoutubeDL(opts) as ydl:
+        info = ydl.extract_info(url, download=True)
+        path = ydl.prepare_filename(info)
+        if kind == "a" and value in ("mp3", "m4a", "aac"):
+            base = os.path.splitext(path)[0]
+            path = base + "." + value
+        name = os.path.basename(path)
+        return path, name
+
+# =======================
+# App + Health
+# =======================
+app = Client("dl_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN, sleep_threshold=120)
+
+async def health(_):
+    return web.Response(text="OK")
+
+# =======================
+# Commands
+# =======================
 @app.on_message(filters.command("start") & filters.private)
-async def start_cmd(_, m):
-    get_user(m.from_user.id)["state"] = "none"
-    await m.reply("Chief, systems are ready." if m.from_user.id == OWNER_ID else "Appreciate you using this bot.", reply_markup=get_main_btns(m.from_user.id))
+async def cmd_start(_, m: types.Message):
+    user_get(m.from_user.id)  # init
+    db_save()
+    await m.reply_text(
+        "Chief, systems are ready." if m.from_user.id == OWNER_ID else "Appreciate you using this bot.",
+        reply_markup=main_menu_markup(m.from_user.id),
+    )
 
-@app.on_message((filters.video | filters.document | filters.forwarded) & filters.private)
-async def media_handler(client, m):
-    uid, uid_s = m.from_user.id, str(m.from_user.id)
-    if not await is_subscribed(uid): return await m.reply("⚠️ Join channel first.", reply_markup=types.InlineKeyboardMarkup([[types.InlineKeyboardButton("Join", url=INVITE_LINK)], [types.InlineKeyboardButton("🔄 Verify", callback_data="cb_verify")]]))
-    
-    status = await m.reply("📥 Downloading...")
-    path = os.path.join(DOWNLOAD_DIR, f"f_{uid}")
-    media = m.video or m.document
+@app.on_message(filters.command("help") & filters.private)
+async def cmd_help(_, m: types.Message):
+    await m.reply_text(
+        "/start\n/help\n/id\n/setcustomthumbnail\n\n"
+        "Send a YouTube link to choose format.\n"
+        "Send any other link to download.\n"
+        "Forward any file to rename/upload.\n",
+        reply_markup=main_menu_markup(m.from_user.id),
+    )
+
+@app.on_message(filters.command("id") & filters.private)
+async def cmd_id(_, m: types.Message):
+    await m.reply_text(f"Your ID: `{m.from_user.id}`")
+
+@app.on_message(filters.command("setcustomthumbnail") & filters.private)
+async def cmd_setthumb(_, m: types.Message):
+    u = user_get(m.from_user.id)
+    u["state"] = "await_thumb"
+    db_save()
+    await m.reply_text("Send a photo now to set as your custom thumbnail.")
+
+# =======================
+# Photo (thumbnail)
+# =======================
+@app.on_message(filters.photo & filters.private)
+async def on_photo(_, m: types.Message):
+    uid = m.from_user.id
+    u = user_get(uid)
+    if u.get("state") != "await_thumb":
+        return  # ignore random photos
+    path = os.path.join(THUMB_DIR, f"{uid}.jpg")
     await m.download(path)
-    DB["active"][uid_s] = {"path": path, "name": getattr(media, "file_name", "file.mp4"), "status": "ready"}
-    save_db(); await status.edit("✅ Downloaded to server.", reply_markup=get_ready_menu())
+    u["thumb"] = path
+    u["state"] = "none"
+    db_save()
+    await m.reply_text("Thumbnail saved.", reply_markup=main_menu_markup(uid))
 
-@app.on_message(filters.text & ~filters.command(["start"]) & filters.private)
-async def text_handler(client, m):
-    uid, uid_s = m.from_user.id, str(m.from_user.id)
-    user = get_user(uid)
+# =======================
+# Forwarded files
+# =======================
+@app.on_message((filters.video | filters.document | filters.audio | filters.voice | filters.photo | filters.animation) & filters.private)
+async def on_forwarded(_, m: types.Message):
+    uid = m.from_user.id
+    if not await is_subscribed(uid):
+        await m.reply_text("Join channel first.", reply_markup=join_markup())
+        return
 
-    if user["state"] == "renaming" and uid_s in DB["active"]:
-        state = DB["active"][uid_s]
-        ext = os.path.splitext(state["path"])[1] or ".mp4"
-        new_name = m.text if m.text.endswith(ext) else f"{m.text}{ext}"
+    media = m.video or m.document or m.audio or m.voice or m.photo or m.animation
+    if not media:
+        return
+
+    # download to server
+    status = await m.reply_text("Downloading…", reply_markup=types.InlineKeyboardMarkup([[types.InlineKeyboardButton("Cancel", callback_data="act_cancel")]]))
+    path = os.path.join(DOWNLOAD_DIR, f"fwd_{uid}_{int(time.time())}")
+    s = {"cancel": False}
+    session_set(uid, s)
+
+    try:
+        await m.download(path)
+    except Exception:
+        session_clear(uid)
+        return await safe_edit(status, "Download failed.", None)
+
+    # determine name/ext
+    orig = getattr(media, "file_name", None)
+    if not orig:
+        # guess ext from path after download (pyrogram keeps original ext)
+        orig = os.path.basename(path)
+    name = safe_filename(orig)
+    ext = os.path.splitext(name)[1] or os.path.splitext(path)[1] or ""
+
+    sess = {
+        "path": path,
+        "orig_name": name,
+        "name": name,
+        "ext": ext,
+        "status": "ready",
+        "cancel": False,
+    }
+    session_set(uid, sess)
+
+    await safe_edit(status, f"Downloaded: `{name}`", reply_markup=ready_markup())
+
+# =======================
+# Text handler (links + rename input + broadcast input)
+# =======================
+@app.on_message(filters.text & ~filters.command(["start", "help", "id", "setcustomthumbnail"]) & filters.private)
+async def on_text(_, m: types.Message):
+    uid = m.from_user.id
+    u = user_get(uid)
+
+    # rename input
+    if u.get("state") == "await_rename_name":
+        sess = session_get(uid)
+        if not sess or "path" not in sess:
+            u["state"] = "none"
+            db_save()
+            return await m.reply_text("No active file. Send again.")
+        base = safe_filename(m.text)
+        new_name = base + (sess.get("ext") or file_ext_from_path(sess["path"]) or "")
         new_path = os.path.join(DOWNLOAD_DIR, new_name)
-        os.rename(state["path"], new_path)
-        state.update({"path": new_path, "name": new_name})
-        user["state"] = "none"; save_db()
-        return await m.reply(f"✅ Name set to: `{new_name}`", reply_markup=get_ready_menu())
-
-    if m.text.startswith("http"):
-        if not await is_subscribed(uid): return await m.reply("⚠️ Join channel.", reply_markup=types.InlineKeyboardMarkup([[types.InlineKeyboardButton("Join", url=INVITE_LINK)], [types.InlineKeyboardButton("🔄 Verify", callback_data="cb_verify")]]))
-        
-        status = await m.reply("🔍 Analyzing...")
-        if "youtube.com" in m.text or "youtu.be" in m.text:
-            DB["active"][uid_s] = {"url": m.text, "status": "choosing"}
-            save_db()
-            btns = [[types.InlineKeyboardButton("1080p", callback_data="yt_1080"), types.InlineKeyboardButton("720p", callback_data="yt_720")],
-                    [types.InlineKeyboardButton("480p", callback_data="yt_480"), types.InlineKeyboardButton("MP3", callback_data="yt_mp3")],
-                    [types.InlineKeyboardButton("❌ Cancel", callback_data="cb_cancel")]]
-            return await status.edit("🎬 YouTube Format:", reply_markup=types.InlineKeyboardMarkup(btns))
-        
         try:
-            with YoutubeDL({'quiet': True}) as ydl:
-                info = ydl.extract_info(m.text, download=True)
-                path = ydl.prepare_filename(info)
-                DB["active"][uid_s] = {"path": path, "name": os.path.basename(path), "status": "ready"}
-                save_db(); await status.edit("✅ Ready.", reply_markup=get_ready_menu())
-        except Exception as e: await status.edit(f"❌ Error: {str(e)[:50]}")
+            os.rename(sess["path"], new_path)
+        except Exception:
+            u["state"] = "none"
+            db_save()
+            return await m.reply_text("Rename failed.")
+        sess["path"] = new_path
+        sess["name"] = new_name
+        sess["status"] = "ready"
+        u["state"] = "none"
+        session_set(uid, sess)
+        return await m.reply_text(f"Renamed: `{new_name}`", reply_markup=ready_markup())
 
+    # broadcast text
+    if uid == OWNER_ID and u.get("state") == "await_bc_text":
+        u["state"] = "none"
+        u["pending"]["broadcast_text"] = m.text
+        db_save()
+        return await m.reply_text(
+            f"Preview:\n\n{m.text}",
+            reply_markup=broadcast_confirm_markup()
+        )
+
+    # link
+    text = m.text.strip()
+    if not (text.startswith("http://") or text.startswith("https://")):
+        return
+
+    if not await is_subscribed(uid):
+        await m.reply_text("Join channel first.", reply_markup=join_markup())
+        return
+
+    status = await m.reply_text("Analyzing…", reply_markup=types.InlineKeyboardMarkup([[types.InlineKeyboardButton("Cancel", callback_data="act_cancel")]]))
+    sess = {"cancel": False}
+    session_set(uid, sess)
+
+    if is_youtube(text):
+        sess = {"url": text, "status": "await_format", "cancel": False}
+        session_set(uid, sess)
+        return await safe_edit(status, "YouTube detected. Select a format:", reply_markup=youtube_format_markup())
+
+    # generic
+    try:
+        await safe_edit(status, "Downloading…", reply_markup=types.InlineKeyboardMarkup([[types.InlineKeyboardButton("Cancel", callback_data="act_cancel")]]))
+        path, name = await download_generic(text)
+        ext = os.path.splitext(name)[1]
+        sess = {
+            "path": path,
+            "orig_name": name,
+            "name": name,
+            "ext": ext,
+            "status": "ready",
+            "cancel": False,
+        }
+        session_set(uid, sess)
+        return await safe_edit(status, f"Downloaded: `{name}`", reply_markup=ready_markup())
+    except Exception as e:
+        session_clear(uid)
+        return await safe_edit(status, f"Error: {str(e)[:120]}", reply_markup=None)
+
+# =======================
+# Callbacks (ALL buttons)
+# =======================
 @app.on_callback_query()
-async def cb_handler(client, cb: types.CallbackQuery):
-    uid, uid_s = cb.from_user.id, str(cb.from_user.id)
-    data, user = cb.data, get_user(uid)
+async def on_cb(_, cb: types.CallbackQuery):
+    uid = cb.from_user.id
+    data = cb.data
+    u = user_get(uid)
     await cb.answer()
 
-    if data == "cb_exit": return await cb.message.delete()
-    if data == "cb_id": return await cb.answer(f"ID: {uid}", show_alert=True)
-    if data == "cb_help": return await safe_edit(cb.message, "📖 Send a link or forward a file.", reply_markup=get_main_btns(uid))
-    if data == "cb_verify":
-        if await is_subscribed(uid): return await safe_edit(cb.message, "✅ Verified!", reply_markup=get_main_btns(uid))
-        else: return await cb.answer("❌ Join first!", show_alert=True)
-
-    if data == "cb_thumb_mgr":
-        btns = [[types.InlineKeyboardButton("👁 View Thumbnail", callback_data="t_view"), types.InlineKeyboardButton("🗑 Delete Thumbnail", callback_data="t_del")]]
-        return await safe_edit(cb.message, "🖼 **Thumbnail Manager**", reply_markup=types.InlineKeyboardMarkup(btns))
-
-    if data == "t_view":
-        if user["thumb"]: await cb.message.reply_photo(user["thumb"])
-        else: await cb.answer("No thumbnail!", show_alert=True)
-        return
-    if data == "t_del":
-        user["thumb"] = None; save_db(); return await cb.answer("Deleted!")
-
-    if data == "cb_cancel":
-        DB["active"].pop(uid_s, None); return await safe_edit(cb.message, "❌ Cancelled.")
-
-    if uid_s not in DB["active"]: return await cb.answer("Expired session.")
-    state = DB["active"][uid_s]
-
-    if data.startswith("yt_"):
-        fmt = data.split("_")[1]
-        await safe_edit(cb.message, f"⏳ Downloading YouTube {fmt}...")
-        y_opts = {'format': f'bestvideo[height<={fmt}]+bestaudio/best' if fmt.isdigit() else 'bestaudio/best', 'outtmpl': f'{DOWNLOAD_DIR}/%(title)s.%(ext)s'}
-        with YoutubeDL(y_opts) as ydl:
-            info = ydl.extract_info(state["url"], download=True)
-            path = ydl.prepare_filename(info)
-            state.update({"path": path, "name": os.path.basename(path), "status": "ready"}); save_db()
-            await safe_edit(cb.message, "✅ Ready.", reply_markup=get_ready_menu())
-
-    if data == "cb_ren_start": return await safe_edit(cb.message, "✏️ **Rename**", reply_markup=get_rename_options())
-    if data == "cb_ren_def": return await safe_edit(cb.message, "✅ Using default name.", reply_markup=get_ready_menu())
-    if data == "cb_ren_cus": user["state"] = "renaming"; return await safe_edit(cb.message, "📝 Send new name:")
-    if data == "cb_ready_back": return await safe_edit(cb.message, "✅ Ready.", reply_markup=get_ready_menu())
-    
-    if data == "cb_up_start": return await safe_edit(cb.message, "📤 **Upload**", reply_markup=get_upload_options())
-
-    if data.startswith("cb_up_"):
-        await safe_edit(cb.message, "📤 Uploading..."); path = state["path"]
+    # ---- Menu buttons (always work)
+    if data == "menu_help":
+        return await safe_edit(cb.message, "Commands:\n/start\n/help\n/id\n/setcustomthumbnail", reply_markup=main_menu_markup(uid))
+    if data == "menu_id":
+        return await cb.answer(f"Your ID: {uid}", show_alert=True)
+    if data == "menu_exit":
         try:
-            if data == "cb_up_scr":
-                screens = await take_screenshots(path, uid)
-                if screens: await client.send_media_group(uid, screens)
-            
-            if data == "cb_up_vid": await client.send_video(uid, video=path, thumb=user["thumb"], caption=f"`{state['name']}`")
-            else: await client.send_document(uid, document=path, thumb=user["thumb"], caption=f"`{state['name']}`")
             await cb.message.delete()
-        finally:
-            if os.path.exists(path): os.remove(path)
-            DB["active"].pop(uid_s, None); save_db()
+        except Exception:
+            pass
+        return
 
-# --- STARTUP ---
-async def main():
-    if not os.path.exists(DOWNLOAD_DIR): os.makedirs(DOWNLOAD_DIR)
-    if not os.path.exists(THUMB_DIR): os.makedirs(THUMB_DIR)
-    load_db(); await app.start()
-    server = web.Application(); server.add_routes([web.get('/', lambda r: web.Response(text="OK"))])
-    runner = web.AppRunner(server); await runner.setup()
-    await web.TCPSite(runner, '0.0.0.0', 8000).start()
-    await idle()
+    # ---- Thumbnail manager (strict)
+    if data == "thumb_menu":
+        return await safe_edit(cb.message, "Thumbnail Manager", reply_markup=thumb_menu_markup())
+    if data == "thumb_view":
+        thumb = u.get("thumb")
+        if thumb and os.path.exists(thumb):
+            await cb.message.reply_photo(thumb, caption="Your thumbnail")
+        else:
+            await cb.answer("No thumbnail set.", show_alert=True)
+        return
+    if data == "thumb_delete":
+        thumb = u.get("thumb")
+        if thumb and os.path.exists(thumb):
+            try:
+                os.remove(thumb)
+            except Exception:
+                pass
+        u["thumb"] = None
+        db_save()
+        await cb.answer("Deleted.", show_alert=True)
+        return
 
-if __name__ == "__main__":
-    app.run(main())
+    # ---- Join verify
+    if data == "join_verify":
+        ok = await is_subscribed(uid)
+        if ok:
+            return await safe_edit(cb.message, "Verified. You can use the bot now.", reply_markup=main_menu_markup(uid))
+        # resend same message (edit), no loops
+        return await safe_edit(cb.message, "Join channel first.", reply_markup=join_markup())
+
+    # ---- Admin panel (handlers exist even if hidden)
+    if data == "admin_menu":
+        if uid != OWNER_ID:
+            return await cb.answer("Not allowed.", show_alert=True)
+        return await safe_edit(cb.message, "Admin Dashboard", reply_markup=admin_menu_markup())
+
+    if data == "admin_back":
+        return await safe_edit(cb.message, "Main menu", reply_markup=main_menu_markup(uid))
+
+    if data == "admin_reports":
+        if uid != OWNER_ID:
+            return await cb.answer("Not allowed.", show_alert=True)
+        users_count = len(DB["users"])
+        active_count = len(DB["active"])
+        total, used, free = shutil.disk_usage("/")
+        txt = (
+            f"Users: {users_count}\n"
+            f"Active sessions: {active_count}\n"
+            f"Disk used: {human_size(used)} / {human_size(total)} (free {human_size(free)})"
+        )
+        return await safe_edit(cb.message, txt, reply_markup=admin_menu_markup())
+
+    if data == "admin_broadcast":
+        if uid != OWNER_ID:
+            return await cb.answer("Not allowed.", show_alert=True)
+        u["state"] = "await_bc_text"
+        db_save()
+        return await safe_edit(cb.message, "Send broadcast text now.", reply_markup=admin_menu_markup())
+
+    if data == "bc_stop":
+        if uid != OWNER_ID:
+            return
+        u["state"] = "none"
+        u["pending"]["broadcast_text"] = ""
+        db_save()
+        return await safe_edit(cb.message, "Broadcast cancelled.", reply_markup=admin_menu_markup())
+
+    if data == "bc_confirm":
+        if uid != OWNER_ID:
+            return
+        text = u.get("pending", {}).get("broadcast_text", "")
+        if not text:
+            return await cb.answer("No broadcast text.", show_alert=True)
+        sent = 0
+        for k in list(DB["users"].keys()):
+            try:
+                await app.send_message(int(k), f"Broadcast:\n\n{text}")
+                sent += 1
+                await asyncio.sleep(0.05)
+            except Exception:
+                continue
+        u["pending"]["broadcast_text"] = ""
+        db_save()
+        return await safe_edit(cb.message, f"Sent to {sent} users.", reply_markup=admin_menu_markup())
+
+    # ---- Session-based actions
+    sess = session_get(uid)
+
+    if data == "act_cancel":
+        if sess and sess.get("path") and os.path.exists(sess["path"]):
+            try:
+                os.remove(sess["path"])
+            except Exception:
+                pass
+        session_clear(uid)
+        return await safe_edit(cb.message, "Cancelled.", reply_markup=None)
+
+    if not sess:
+        return await cb.answer("No active task.", show_alert=True)
+
+    # YouTube format selection
+    if data.startswith("yt_v_"):
+        h = data.split("_")[-1]
+        try:
+            await safe_edit(cb.message, f"Downloading YouTube video {h}p…", reply_markup=types.InlineKeyboardMarkup([[types.InlineKeyboardButton("Cancel", callback_data="act_cancel")]]))
+            path, name = await download_youtube(sess["url"], "v", h)
+            ext = os.path.splitext(name)[1]
+            sess = {"path": path, "orig_name": name, "name": name, "ext": ext, "status": "ready", "cancel": False}
+            session_set(uid, sess)
+            return await safe_edit(cb.message, f"Downloaded: `{name}`", reply_markup=ready_markup())
+        except Exception as e:
+            session_clear(uid)
+            return await safe_edit(cb.message, f"Error: {str(e)[:120]}", reply_markup=None)
+
+    if data.startswith("yt_a_"):
+        codec = data.split("_")[-1]
+        try:
+            await safe_edit(cb.message, f"Downloading YouTube audio {codec.upper()}…", reply_markup=types.InlineKeyboardMarkup([[types.InlineKeyboardButton("Cancel", callback_data="act_cancel")]]))
+            path, name = await download_youtube(sess["url"], "a", codec)
+            ext = os.path.splitext(name)[1]
+            sess = {"path": path, "orig_name": name, "name": name, "ext": ext, "status": "ready", "cancel": False}
+            session_set(uid, sess)
+            return await safe_edit(cb.message, f"Downloaded: `{name}`", reply_markup=ready_markup())
+        except Exception as e:
+            session_clear(uid)
+            return await safe_edit(cb.message, f"Error: {str(e)[:120]}", reply_markup=None)
+
+    # Rename
+    if data == "act_rename":
+        return await safe_edit(cb.message, "Rename:", reply_markup=rename_choice_markup())
+
+    if data == "ren_default":
+        u["state"] = "none"
+        db_save()
+        return await safe_edit(cb.message, f"Using default name: `{sess.get('name')}`", reply_markup=ready_markup())
+
+    if data == "ren_custom":
+        u["state"] = "await_rename_name"
+        db_save()
+        return await safe_edit(cb.message, "Send new filename text (extension will be added automatically).", reply_markup=None)
+
+    # Upload
+    if data == "act_upload":
+        return await safe_edit(cb.message, "Choose upload type:", reply_markup=upload_choice_markup())
+
+    if data in ("up_as_video", "up_as_file", "up_with_screens"):
+        if not sess.get("path") or not os.path.exists(sess["path"]):
+            session_clear(uid)
+            return await safe_edit(cb.message, "File missing. Send again.", reply_markup=None)
+
+        as_video = (data == "up_as_video")
+        do_screens = (data == "up_with_screens")
+
+        try:
+            # screenshots first if requested (pipeline unchanged)
+            if do_screens and as_video:
+                medias, outdir = await generate_screenshots(sess["path"], uid)
+                if medias:
+                    await app.send_media_group(uid, medias)
+                try:
+                    shutil.rmtree(outdir, 
