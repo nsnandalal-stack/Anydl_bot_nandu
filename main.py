@@ -219,11 +219,12 @@ def rename_kb():
 
 def yt_kb():
     return types.InlineKeyboardMarkup([
-        [types.InlineKeyboardButton("🎬 720p", callback_data="yt_720"),
-         types.InlineKeyboardButton("🎵 MP3", callback_data="yt_mp3")],
-        [types.InlineKeyboardButton("📹 1080p", callback_data="yt_1080"),
-         types.InlineKeyboardButton("📹 480p", callback_data="yt_480"),
-         types.InlineKeyboardButton("📹 360p", callback_data="yt_360")],
+        [types.InlineKeyboardButton("🎬 1080p", callback_data="yt_1080"),
+         types.InlineKeyboardButton("🎬 720p", callback_data="yt_720"),
+         types.InlineKeyboardButton("📹 480p", callback_data="yt_480")],
+        [types.InlineKeyboardButton("📹 360p", callback_data="yt_360"),
+         types.InlineKeyboardButton("🎵 MP3 320k", callback_data="yt_mp3_320"),
+         types.InlineKeyboardButton("🎵 MP3 192k", callback_data="yt_mp3")],
         [types.InlineKeyboardButton("❌ Cancel", callback_data="cancel")]
     ])
 
@@ -399,17 +400,36 @@ async def download_ytdlp(uid: int, url: str, msg, quality: str = "720"):
         print(f"🍪 Using cookies: {COOKIES_PATH}")
     
     # Format selection
-    if quality == "mp3":
-        opts["format"] = "bestaudio/best"
+    if quality.startswith("mp3"):
+        # High-quality audio extraction
+        bitrate = "320" if quality == "mp3_320" else "192"
+        opts["format"] = "bestaudio[ext=m4a]/bestaudio/best"
         opts["postprocessors"] = [{
             "key": "FFmpegExtractAudio",
             "preferredcodec": "mp3",
-            "preferredquality": "192"
+            "preferredquality": bitrate
         }]
     else:
         target = int(quality) if quality.isdigit() else 720
-        # IMPROVED format selection
-        opts["format"] = f"bestvideo[height<={target}][ext=mp4]+bestaudio[ext=m4a]/best[height<={target}][ext=mp4]/best"
+        # IMPROVED format selection for better quality
+        if target >= 1080:
+            # For 1080p, get best video+audio
+            opts["format"] = (
+                "bestvideo[height<=1080][ext=mp4]+bestaudio[ext=m4a]/"
+                "bestvideo[height<=1080]+bestaudio/"
+                "best[height<=1080]/"
+                "best"
+            )
+        else:
+            # For other qualities
+            opts["format"] = (
+                f"bestvideo[height<={target}][ext=mp4]+bestaudio[ext=m4a]/"
+                f"bestvideo[height<={target}]+bestaudio/"
+                f"best[height<={target}]/"
+                "best"
+            )
+        # Merge video+audio into single file
+        opts["merge_output_format"] = "mp4"
     
     loop = asyncio.get_event_loop()
     
@@ -438,15 +458,20 @@ async def download_cobalt(uid: int, url: str, msg, quality: str = "720"):
     
     timeout = ClientTimeout(total=60)
     
+    # Handle audio quality
+    is_audio_only = quality.startswith("mp3")
+    audio_bitrate = "320" if quality == "mp3_320" else "192"
+    
     for instance in cobalt_instances:
         try:
             payload = {
                 "url": url,
                 "vCodec": "h264",
-                "vQuality": quality if quality.isdigit() else "720",
-                "aFormat": "mp3" if quality == "mp3" else "best",
+                "vQuality": "max" if quality == "1080" else quality if quality.isdigit() else "720",
+                "aFormat": "mp3" if is_audio_only else "best",
                 "filenamePattern": "basic",
-                "isAudioOnly": quality == "mp3"
+                "isAudioOnly": is_audio_only,
+                "audioBitrate": audio_bitrate if is_audio_only else "best"
             }
             
             async with ClientSession(timeout=timeout) as session:
@@ -460,7 +485,7 @@ async def download_cobalt(uid: int, url: str, msg, quality: str = "720"):
                         download_url = data.get("url")
                         if download_url:
                             filename = f"video_{int(time.time())}"
-                            filename += ".mp3" if quality == "mp3" else ".mp4"
+                            filename += ".mp3" if is_audio_only else ".mp4"
                             return await download_from_url(uid, download_url, msg, filename, quality)
         
         except Exception as e:
@@ -860,8 +885,17 @@ async def on_cb(_, cb):
         
         quality = data.replace("yt_", "")
         
+        # Format quality display
+        quality_display = quality.upper()
+        if quality == "mp3":
+            quality_display = "MP3 192kbps"
+        elif quality == "mp3_320":
+            quality_display = "MP3 320kbps"
+        elif quality.isdigit():
+            quality_display = f"{quality}p"
+        
         try:
-            await safe_edit(cb.message, f"⬇️ **Downloading {quality}...**", cancel_kb())
+            await safe_edit(cb.message, f"⬇️ **Downloading {quality_display}...**", cancel_kb())
             path, title = await download_video(uid, sess["url"], cb.message, quality)
             name = os.path.basename(path)
             size = os.path.getsize(path)
