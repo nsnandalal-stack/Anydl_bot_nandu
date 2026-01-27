@@ -24,9 +24,56 @@ INVITE_LINK = "https://t.me/+eooytvOAwjc0NTI1"
 DOWNLOAD_DIR = "/tmp/downloads"
 THUMB_DIR = "/tmp/thumbnails"
 DB_FILE = "/tmp/bot_db.json"
-COOKIES_FILE = "/app/cookies/cookies.txt"
 
 DAILY_LIMIT = 5 * 1024 * 1024 * 1024
+
+# Global cookies path
+COOKIES_PATH = None
+
+# =======================
+# FIND COOKIES
+# =======================
+def find_cookies():
+    """Find and validate cookies file"""
+    global COOKIES_PATH
+    
+    possible_paths = [
+        "/app/cookies/cookies.txt",
+        "/app/cookies.txt",
+        "cookies/cookies.txt",
+        "cookies.txt",
+        os.path.join(os.getcwd(), "cookies", "cookies.txt"),
+        os.path.join(os.getcwd(), "cookies.txt"),
+    ]
+    
+    # Also check for any .txt in cookies folder
+    for folder in ["/app/cookies", "cookies"]:
+        if os.path.isdir(folder):
+            for f in os.listdir(folder):
+                if f.endswith(".txt"):
+                    possible_paths.insert(0, os.path.join(folder, f))
+    
+    for path in possible_paths:
+        if os.path.exists(path) and os.path.isfile(path):
+            try:
+                with open(path, 'r') as f:
+                    content = f.read()
+                    # Check if it's a valid Netscape cookie file
+                    if '.youtube.com' in content or 'youtube' in content.lower():
+                        COOKIES_PATH = path
+                        size = os.path.getsize(path)
+                        print(f"✅ COOKIES FOUND: {path} ({size} bytes)")
+                        # Print first few lines for debug
+                        lines = content.split('\n')[:5]
+                        for line in lines:
+                            print(f"   {line[:80]}")
+                        return path
+            except Exception as e:
+                print(f"❌ Error reading {path}: {e}")
+    
+    print("❌ NO VALID COOKIES FOUND!")
+    print(f"   Searched: {possible_paths}")
+    return None
 
 # =======================
 # DATABASE
@@ -87,15 +134,12 @@ def is_yt(url: str) -> bool:
     return any(x in url.lower() for x in ["youtube.com", "youtu.be"])
 
 def extract_video_id(url: str) -> str:
-    """Extract YouTube video ID from URL"""
     if "youtu.be/" in url:
         return url.split("youtu.be/")[1].split("?")[0].split("/")[0]
     elif "v=" in url:
         return url.split("v=")[1].split("&")[0]
     elif "/shorts/" in url:
         return url.split("/shorts/")[1].split("?")[0]
-    elif "/embed/" in url:
-        return url.split("/embed/")[1].split("?")[0]
     return ""
 
 def human_size(n) -> str:
@@ -177,7 +221,7 @@ def rename_kb():
 
 def yt_kb():
     return types.InlineKeyboardMarkup([
-        [types.InlineKeyboardButton("🎬 Video (720p)", callback_data="yt_720"),
+        [types.InlineKeyboardButton("🎬 720p", callback_data="yt_720"),
          types.InlineKeyboardButton("🎵 MP3", callback_data="yt_mp3")],
         [types.InlineKeyboardButton("📹 1080p", callback_data="yt_1080"),
          types.InlineKeyboardButton("📹 480p", callback_data="yt_480"),
@@ -187,11 +231,12 @@ def yt_kb():
 
 def admin_kb():
     return types.InlineKeyboardMarkup([
-        [types.InlineKeyboardButton("📊 Bot Stats", callback_data="adm_stats"),
+        [types.InlineKeyboardButton("📊 Stats", callback_data="adm_stats"),
          types.InlineKeyboardButton("📢 Broadcast", callback_data="adm_bc")],
-        [types.InlineKeyboardButton("👑 Add Pro", callback_data="adm_pro"),
+        [types.InlineKeyboardButton("👑 Pro", callback_data="adm_pro"),
          types.InlineKeyboardButton("🚫 Ban", callback_data="adm_ban")],
-        [types.InlineKeyboardButton("✅ Unban", callback_data="adm_unban")],
+        [types.InlineKeyboardButton("✅ Unban", callback_data="adm_unban"),
+         types.InlineKeyboardButton("🍪 Cookies", callback_data="adm_cookies")],
         [types.InlineKeyboardButton("🔙 Back", callback_data="back")]
     ])
 
@@ -202,33 +247,24 @@ def bc_kb():
     ])
 
 # =======================
-# DOWNLOAD FROM URL
+# DOWNLOAD HELPER
 # =======================
 async def download_from_url(uid: int, url: str, msg, filename: str = None, quality: str = "720"):
-    """Download file from URL with progress"""
+    """Download file from URL"""
     
     start_time = time.time()
     last_update = 0
     timeout = ClientTimeout(total=600)
     
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
-    }
-    
-    async with ClientSession(timeout=timeout, headers=headers) as session:
+    async with ClientSession(timeout=timeout) as session:
         async with session.get(url) as resp:
             if resp.status != 200:
                 raise Exception(f"HTTP {resp.status}")
             
-            # Get filename
             if not filename:
                 cd = resp.headers.get("Content-Disposition", "")
                 if "filename=" in cd:
                     filename = cd.split("filename=")[1].strip('"\'').split(";")[0]
-                    try:
-                        filename = filename.encode('latin-1').decode('utf-8', errors='ignore')
-                    except:
-                        pass
                 else:
                     ext = ".mp3" if quality == "mp3" else ".mp4"
                     filename = f"video_{int(time.time())}{ext}"
@@ -258,13 +294,13 @@ async def download_from_url(uid: int, url: str, msg, filename: str = None, quali
                         eta = (total - done) / speed if speed > 0 and total > 0 else 0
                         pct = (done / total * 100) if total > 0 else 0
                         
-                        text = (
+                        await safe_edit(msg, 
                             f"⬇️ **Downloading...**\n\n"
                             f"`[{progress_bar(pct)}]` {pct:.1f}%\n\n"
                             f"📦 {human_size(done)} / {human_size(total)}\n"
-                            f"⚡ {human_size(speed)}/s • ⏱️ {human_time(eta)}"
+                            f"⚡ {human_size(speed)}/s • ⏱️ {human_time(eta)}", 
+                            cancel_kb()
                         )
-                        await safe_edit(msg, text, cancel_kb())
             
             return path, os.path.splitext(filename)[0]
 
@@ -272,20 +308,20 @@ async def download_from_url(uid: int, url: str, msg, filename: str = None, quali
 # METHOD 1: PIPED API
 # =======================
 async def download_piped(uid: int, url: str, msg, quality: str = "720"):
-    """Download using Piped API"""
+    """Download using Piped instances"""
     
-    await safe_edit(msg, "🔄 **Method 1: Piped API...**", cancel_kb())
+    await safe_edit(msg, "🔄 **Method 1: Piped...**", cancel_kb())
     
     video_id = extract_video_id(url)
     if not video_id:
-        raise Exception("Invalid YouTube URL")
+        raise Exception("Invalid URL")
     
-    # Working Piped instances
     instances = [
         "https://pipedapi.kavin.rocks",
-        "https://pipedapi.adminforge.de",
+        "https://pipedapi.adminforge.de", 
         "https://api.piped.yt",
-        "https://pipedapi.in.projectsegfau.lt"
+        "https://pipedapi.in.projectsegfau.lt",
+        "https://pipedapi.moomoo.me"
     ]
     
     timeout = ClientTimeout(total=30)
@@ -293,120 +329,49 @@ async def download_piped(uid: int, url: str, msg, quality: str = "720"):
     for instance in instances:
         try:
             async with ClientSession(timeout=timeout) as session:
-                api_url = f"{instance}/streams/{video_id}"
-                
-                async with session.get(api_url) as resp:
+                async with session.get(f"{instance}/streams/{video_id}") as resp:
                     if resp.status != 200:
                         continue
                     
                     data = await resp.json()
                     title = safe_name(data.get("title", f"video_{video_id}"))
                     
-                    # Get download URL
                     if quality == "mp3":
                         streams = data.get("audioStreams", [])
                         if streams:
-                            # Get highest quality audio
                             streams.sort(key=lambda x: x.get("bitrate", 0), reverse=True)
                             download_url = streams[0].get("url")
-                            filename = f"{title}.mp3"
-                        else:
-                            continue
+                            return await download_from_url(uid, download_url, msg, f"{title}.mp3", quality)
                     else:
                         streams = data.get("videoStreams", [])
                         target = int(quality) if quality.isdigit() else 720
                         
-                        # Filter by quality
-                        suitable = [s for s in streams if s.get("quality", "").startswith(str(target))]
-                        if not suitable:
-                            suitable = [s for s in streams if "720" in s.get("quality", "")]
-                        if not suitable and streams:
-                            suitable = streams
+                        # Find best match
+                        best = None
+                        for s in streams:
+                            q = s.get("quality", "")
+                            if str(target) in q:
+                                best = s
+                                break
                         
-                        if suitable:
-                            download_url = suitable[0].get("url")
-                            filename = f"{title}.mp4"
-                        else:
-                            continue
-                    
-                    if download_url:
-                        return await download_from_url(uid, download_url, msg, filename, quality)
-        except Exception as e:
+                        if not best and streams:
+                            best = streams[0]
+                        
+                        if best:
+                            download_url = best.get("url")
+                            return await download_from_url(uid, download_url, msg, f"{title}.mp4", quality)
+        except:
             continue
     
-    raise Exception("Piped API failed")
+    raise Exception("Piped failed")
 
 # =======================
-# METHOD 2: COBALT API (NEW FORMAT)
-# =======================
-async def download_cobalt(uid: int, url: str, msg, quality: str = "720"):
-    """Download using Cobalt API v2"""
-    
-    await safe_edit(msg, "🔄 **Method 2: Cobalt API...**", cancel_kb())
-    
-    api_url = "https://api.cobalt.tools/api/json"
-    
-    # Quality mapping
-    vquality = "720" if quality in ["720", "mp3"] else quality
-    
-    payload = {
-        "url": url,
-        "vCodec": "h264",
-        "vQuality": vquality,
-        "aFormat": "mp3",
-        "filenamePattern": "basic",
-        "isAudioOnly": quality == "mp3",
-        "disableMetadata": False
-    }
-    
-    headers = {
-        "Accept": "application/json",
-        "Content-Type": "application/json",
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120.0.0.0"
-    }
-    
-    timeout = ClientTimeout(total=30)
-    
-    async with ClientSession(timeout=timeout) as session:
-        async with session.post(api_url, json=payload, headers=headers) as resp:
-            if resp.status != 200:
-                text = await resp.text()
-                raise Exception(f"Cobalt error: {resp.status}")
-            
-            data = await resp.json()
-            
-            status = data.get("status")
-            
-            if status == "error":
-                raise Exception(data.get("text", "Cobalt error"))
-            
-            download_url = None
-            
-            if status in ["redirect", "stream"]:
-                download_url = data.get("url")
-            elif status == "picker":
-                items = data.get("picker", [])
-                if items:
-                    # Get video (not audio) from picker
-                    for item in items:
-                        if item.get("type") == "video" or "video" in str(item.get("url", "")):
-                            download_url = item.get("url")
-                            break
-                    if not download_url and items:
-                        download_url = items[0].get("url")
-            
-            if not download_url:
-                raise Exception("No download URL")
-            
-            return await download_from_url(uid, download_url, msg, None, quality)
-
-# =======================
-# METHOD 3: YT-DLP WITH COOKIES
+# METHOD 2: YT-DLP (WITH COOKIES)
 # =======================
 async def download_ytdlp(uid: int, url: str, msg, quality: str = "720"):
-    """Download using yt-dlp with cookies"""
+    """Download using yt-dlp with proper cookies"""
     
-    await safe_edit(msg, "🔄 **Method 3: yt-dlp...**", cancel_kb())
+    await safe_edit(msg, "🔄 **Method 2: yt-dlp...**", cancel_kb())
     
     start_time = time.time()
     last = {"t": 0}
@@ -429,13 +394,13 @@ async def download_ytdlp(uid: int, url: str, msg, quality: str = "720"):
         eta = (total - done) / speed if speed > 0 and total > 0 else 0
         pct = (done / total * 100) if total > 0 else 0
         
-        text = (
+        asyncio.get_event_loop().create_task(safe_edit(msg,
             f"⬇️ **Downloading...**\n\n"
             f"`[{progress_bar(pct)}]` {pct:.1f}%\n\n"
             f"📦 {human_size(done)} / {human_size(total)}\n"
-            f"⚡ {human_size(speed)}/s • ⏱️ {human_time(eta)}"
-        )
-        asyncio.get_event_loop().create_task(safe_edit(msg, text, cancel_kb()))
+            f"⚡ {human_size(speed)}/s • ⏱️ {human_time(eta)}",
+            cancel_kb()
+        ))
     
     opts = {
         "quiet": True,
@@ -443,28 +408,34 @@ async def download_ytdlp(uid: int, url: str, msg, quality: str = "720"):
         "outtmpl": f"{DOWNLOAD_DIR}/%(title).70s.%(ext)s",
         "noplaylist": True,
         "progress_hooks": [hook],
-        "retries": 3,
+        "retries": 10,
+        "fragment_retries": 10,
         "socket_timeout": 30,
         "nocheckcertificate": True,
         "geo_bypass": True,
+        "geo_bypass_country": "US",
         "extractor_args": {
             "youtube": {
-                "player_client": ["ios", "android"],
+                "player_client": ["ios", "android", "web"],
+                "player_skip": ["webpage", "configs"],
             }
         },
         "http_headers": {
             "User-Agent": "com.google.ios.youtube/19.09.3 (iPhone14,3; U; CPU iOS 15_6 like Mac OS X)",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Accept-Language": "en-us,en;q=0.5",
+            "Sec-Fetch-Mode": "navigate",
         }
     }
     
-    # Add cookies if exists
-    for cookie_path in [COOKIES_FILE, "cookies/cookies.txt", "cookies.txt", "/app/cookies.txt"]:
-        if os.path.exists(cookie_path):
-            opts["cookiefile"] = cookie_path
-            print(f"✅ Using cookies: {cookie_path}")
-            break
+    # ADD COOKIES - THIS IS CRITICAL!
+    if COOKIES_PATH and os.path.exists(COOKIES_PATH):
+        opts["cookiefile"] = COOKIES_PATH
+        print(f"🍪 yt-dlp using cookies: {COOKIES_PATH}")
+    else:
+        print("⚠️ yt-dlp: No cookies available!")
     
-    # Format
+    # Format selection
     if quality == "mp3":
         opts["format"] = "bestaudio/best"
         opts["postprocessors"] = [{"key": "FFmpegExtractAudio", "preferredcodec": "mp3", "preferredquality": "192"}]
@@ -485,102 +456,88 @@ async def download_ytdlp(uid: int, url: str, msg, quality: str = "720"):
     return await loop.run_in_executor(None, do_dl)
 
 # =======================
-# METHOD 4: Y2MATE STYLE
+# METHOD 3: INVIDIOUS
 # =======================
-async def download_y2mate(uid: int, url: str, msg, quality: str = "720"):
-    """Download using Y2Mate style API"""
+async def download_invidious(uid: int, url: str, msg, quality: str = "720"):
+    """Download using Invidious"""
     
-    await safe_edit(msg, "🔄 **Method 4: Y2Mate...**", cancel_kb())
+    await safe_edit(msg, "🔄 **Method 3: Invidious...**", cancel_kb())
     
     video_id = extract_video_id(url)
     if not video_id:
         raise Exception("Invalid URL")
     
-    # Use a public API
-    api_url = f"https://yt1s.com/api/ajaxSearch/index"
-    
-    headers = {
-        "Content-Type": "application/x-www-form-urlencoded",
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120.0.0.0"
-    }
+    instances = [
+        "https://inv.nadeko.net",
+        "https://invidious.nerdvpn.de",
+        "https://invidious.privacyredirect.com",
+        "https://yt.artemislena.eu",
+        "https://invidious.protokolla.fi"
+    ]
     
     timeout = ClientTimeout(total=30)
     
-    async with ClientSession(timeout=timeout) as session:
-        # Step 1: Get video info
-        data = f"q={url}&vt=mp4" if quality != "mp3" else f"q={url}&vt=mp3"
-        
-        async with session.post(api_url, data=data, headers=headers) as resp:
-            if resp.status != 200:
-                raise Exception("Y2Mate error")
-            
-            result = await resp.json()
-            
-            if result.get("status") != "ok":
-                raise Exception("Y2Mate failed")
-            
-            # Get the links
-            links = result.get("links", {})
-            
-            if quality == "mp3":
-                mp3_links = links.get("mp3", {})
-                if mp3_links:
-                    first_key = list(mp3_links.keys())[0]
-                    download_url = mp3_links[first_key].get("url")
-                    if download_url:
-                        return await download_from_url(uid, download_url, msg, None, quality)
-            else:
-                mp4_links = links.get("mp4", {})
-                target = int(quality) if quality.isdigit() else 720
-                
-                for key, val in mp4_links.items():
-                    if str(target) in val.get("q", ""):
-                        download_url = val.get("url")
-                        if download_url:
-                            return await download_from_url(uid, download_url, msg, None, quality)
+    for instance in instances:
+        try:
+            async with ClientSession(timeout=timeout) as session:
+                async with session.get(f"{instance}/api/v1/videos/{video_id}") as resp:
+                    if resp.status != 200:
+                        continue
+                    
+                    data = await resp.json()
+                    title = safe_name(data.get("title", f"video_{video_id}"))
+                    
+                    if quality == "mp3":
+                        formats = data.get("adaptiveFormats", [])
+                        audio = [f for f in formats if f.get("type", "").startswith("audio")]
+                        if audio:
+                            download_url = audio[0].get("url")
+                            return await download_from_url(uid, download_url, msg, f"{title}.mp3", quality)
+                    else:
+                        formats = data.get("formatStreams", [])
+                        if formats:
+                            download_url = formats[0].get("url")
+                            return await download_from_url(uid, download_url, msg, f"{title}.mp4", quality)
+        except:
+            continue
     
-    raise Exception("Y2Mate failed")
+    raise Exception("Invidious failed")
 
 # =======================
-# MAIN DOWNLOAD FUNCTION
+# MAIN DOWNLOAD
 # =======================
 async def download_video(uid: int, url: str, msg, quality: str = "720"):
-    """Try all methods in order"""
-    
-    methods = [
-        ("Piped", download_piped),
-        ("Cobalt", download_cobalt),
-        ("yt-dlp", download_ytdlp),
-    ]
+    """Try all methods"""
     
     errors = []
     
-    for name, method in methods:
-        try:
-            sess = session_get(uid)
-            if sess and sess.get("cancel"):
-                raise Exception("CANCELLED")
-            
-            result = await method(uid, url, msg, quality)
-            return result
-            
-        except Exception as e:
-            error_msg = str(e)
-            if "CANCELLED" in error_msg:
-                raise
-            errors.append(f"{name}: {error_msg[:50]}")
-            print(f"❌ {name} failed: {error_msg}")
-            continue
+    # Method 1: Piped
+    try:
+        return await download_piped(uid, url, msg, quality)
+    except Exception as e:
+        if "CANCELLED" in str(e): raise
+        errors.append(f"Piped: {str(e)[:40]}")
     
-    # All methods failed - show errors
-    error_text = "\n".join(errors)
-    raise Exception(f"All methods failed:\n{error_text}")
+    # Method 2: yt-dlp
+    try:
+        return await download_ytdlp(uid, url, msg, quality)
+    except Exception as e:
+        if "CANCELLED" in str(e): raise
+        errors.append(f"yt-dlp: {str(e)[:40]}")
+    
+    # Method 3: Invidious
+    try:
+        return await download_invidious(uid, url, msg, quality)
+    except Exception as e:
+        if "CANCELLED" in str(e): raise
+        errors.append(f"Invidious: {str(e)[:40]}")
+    
+    raise Exception("All failed:\n" + "\n".join(errors))
 
 # =======================
 # DIRECT DOWNLOAD
 # =======================
 async def download_direct(uid: int, url: str, msg):
-    """Direct URL download"""
     return await download_from_url(uid, url, msg, None, "720")
 
 # =======================
@@ -595,16 +552,15 @@ async def make_ss(path: str, count: int = 5):
         proc = await asyncio.create_subprocess_shell(cmd, stdout=asyncio.subprocess.PIPE)
         stdout, _ = await proc.communicate()
         dur = float(stdout.decode().strip() or "0")
-        if dur <= 0:
-            return [], out
+        if dur <= 0: return [], out
+        
         interval = dur / (count + 1)
         for i in range(1, count + 1):
             o = os.path.join(out, f"{i}.jpg")
             c = f'ffmpeg -ss {interval * i} -i "{path}" -vframes 1 -q:v 5 -y "{o}" 2>/dev/null'
             p = await asyncio.create_subprocess_shell(c)
             await p.wait()
-            if os.path.exists(o):
-                screens.append(o)
+            if os.path.exists(o): screens.append(o)
         return screens, out
     except:
         return [], out
@@ -621,33 +577,29 @@ async def do_upload(uid, msg, path, name, as_video):
     
     async def prog(done, total):
         sess = session_get(uid)
-        if sess and sess.get("cancel"):
-            raise Exception("CANCELLED")
+        if sess and sess.get("cancel"): raise Exception("CANCELLED")
         now = time.time()
-        if now - last["t"] < 2:
-            return
+        if now - last["t"] < 2: return
         last["t"] = now
         elapsed = now - start_time
         speed = done / elapsed if elapsed > 0 else 0
         eta = (total - done) / speed if speed > 0 and total > 0 else 0
         pct = (done / total * 100) if total > 0 else 0
-        text = (
+        await safe_edit(msg,
             f"📤 **Uploading...**\n\n"
             f"`[{progress_bar(pct)}]` {pct:.1f}%\n\n"
             f"📦 {human_size(done)} / {human_size(total)}\n"
-            f"⚡ {human_size(speed)}/s • ⏱️ {human_time(eta)}"
+            f"⚡ {human_size(speed)}/s • ⏱️ {human_time(eta)}",
+            cancel_kb()
         )
-        await safe_edit(msg, text, cancel_kb())
     
     if as_video:
         await app.send_video(uid, path, caption=f"🎬 `{name}`", file_name=name, supports_streaming=True, thumb=thumb, progress=prog)
-        await safe_edit(msg, "📸 **Generating screenshots...**", None)
+        await safe_edit(msg, "📸 **Screenshots...**", None)
         ss, ss_dir = await make_ss(path, 5)
         if ss:
-            try:
-                await app.send_media_group(uid, [types.InputMediaPhoto(s) for s in ss])
-            except:
-                pass
+            try: await app.send_media_group(uid, [types.InputMediaPhoto(s) for s in ss])
+            except: pass
         shutil.rmtree(ss_dir, ignore_errors=True)
     else:
         await app.send_document(uid, path, caption=f"📄 `{name}`", file_name=name, thumb=thumb, progress=prog)
@@ -667,8 +619,7 @@ async def cmd_start(_, m):
     db_save()
     await m.reply_text(
         f"👋 Hi **{m.from_user.first_name}**!\n\n"
-        f"🚀 Send me any video link to download.\n\n"
-        f"**Supported:** YouTube, Instagram, Twitter, TikTok & more!",
+        f"🚀 Send any video link to download.",
         reply_markup=menu_kb(m.from_user.id)
     )
 
@@ -678,8 +629,7 @@ async def on_text(_, m):
     user = user_get(uid)
     text = m.text.strip()
     
-    if user.get("is_banned"):
-        return
+    if user.get("is_banned"): return
     
     # States
     if user.get("state") == "rename":
@@ -693,14 +643,13 @@ async def on_text(_, m):
         session_set(uid, sess)
         user["state"] = "none"
         db_save()
-        return await m.reply_text(f"✅ Renamed: `{new}`", reply_markup=upload_kb())
+        return await m.reply_text(f"✅ `{new}`", reply_markup=upload_kb())
     
     if user.get("state") == "broadcast" and uid == OWNER_ID:
         user["state"] = "none"
         user["bc"] = text
         db_save()
-        count = len([u for u in DB["users"] if not DB["users"][u].get("is_banned")])
-        return await m.reply_text(f"📢 **Preview:**\n\n{text}\n\n👥 {count} users", reply_markup=bc_kb())
+        return await m.reply_text(f"📢 **Preview:**\n\n{text}", reply_markup=bc_kb())
     
     if user.get("state") == "addpro" and uid == OWNER_ID:
         user["state"] = "none"
@@ -708,7 +657,7 @@ async def on_text(_, m):
         try:
             user_get(int(text))["is_pro"] = True
             db_save()
-            return await m.reply_text(f"✅ `{text}` is PRO!", reply_markup=admin_kb())
+            return await m.reply_text(f"✅ PRO!", reply_markup=admin_kb())
         except:
             return await m.reply_text("❌ Invalid!", reply_markup=admin_kb())
     
@@ -718,7 +667,7 @@ async def on_text(_, m):
         try:
             user_get(int(text))["is_banned"] = True
             db_save()
-            return await m.reply_text(f"✅ `{text}` banned!", reply_markup=admin_kb())
+            return await m.reply_text(f"✅ Banned!", reply_markup=admin_kb())
         except:
             return await m.reply_text("❌ Invalid!", reply_markup=admin_kb())
     
@@ -728,21 +677,20 @@ async def on_text(_, m):
         try:
             user_get(int(text))["is_banned"] = False
             db_save()
-            return await m.reply_text(f"✅ `{text}` unbanned!", reply_markup=admin_kb())
+            return await m.reply_text(f"✅ Unbanned!", reply_markup=admin_kb())
         except:
             return await m.reply_text("❌ Invalid!", reply_markup=admin_kb())
     
-    if not text.startswith("http"):
-        return
+    if not text.startswith("http"): return
     
     if not await is_subscribed(uid):
-        return await m.reply_text("⚠️ **Join our channel first!**", reply_markup=join_kb())
+        return await m.reply_text("⚠️ **Join channel!**", reply_markup=join_kb())
     
-    status = await m.reply_text("🔍 **Analyzing link...**", reply_markup=cancel_kb())
+    status = await m.reply_text("🔍 **Analyzing...**", reply_markup=cancel_kb())
     session_set(uid, {"url": text, "cancel": False})
     
     if is_yt(text):
-        return await safe_edit(status, "🎬 **YouTube detected!**\n\nChoose quality:", yt_kb())
+        return await safe_edit(status, "🎬 **YouTube**\n\nChoose:", yt_kb())
     
     try:
         await safe_edit(status, "⬇️ **Downloading...**", cancel_kb())
@@ -757,16 +705,14 @@ async def on_text(_, m):
         await safe_edit(status, f"✅ **Done!**\n\n📄 `{name}`\n📦 {human_size(size)}", upload_kb())
     except Exception as e:
         session_clear(uid)
-        msg = "❌ **Cancelled!**" if "CANCELLED" in str(e) else f"❌ **Error:** {str(e)[:200]}"
-        await safe_edit(status, msg, None)
+        await safe_edit(status, f"❌ {str(e)[:200]}" if "CANCELLED" not in str(e) else "❌ Cancelled!", None)
 
 @app.on_message((filters.video | filters.document | filters.audio) & filters.private)
 async def on_file(_, m):
     uid = m.from_user.id
-    if user_get(uid).get("is_banned"):
-        return
+    if user_get(uid).get("is_banned"): return
     if not await is_subscribed(uid):
-        return await m.reply_text("⚠️ Join first!", reply_markup=join_kb())
+        return await m.reply_text("⚠️ Join!", reply_markup=join_kb())
     
     media = m.video or m.document or m.audio
     status = await m.reply_text("⬇️ **Downloading...**", reply_markup=cancel_kb())
@@ -778,7 +724,7 @@ async def on_file(_, m):
         await m.download(path)
         size = os.path.getsize(path)
         session_set(uid, {"path": path, "name": name, "ext": get_ext(name), "size": size, "cancel": False})
-        await safe_edit(status, f"✅ **Done!**\n\n📄 `{name}`\n📦 {human_size(size)}", upload_kb())
+        await safe_edit(status, f"✅ `{name}`\n📦 {human_size(size)}", upload_kb())
     except Exception as e:
         session_clear(uid)
         await safe_edit(status, f"❌ {str(e)[:80]}", None)
@@ -786,8 +732,7 @@ async def on_file(_, m):
 @app.on_message(filters.photo & filters.private)
 async def on_photo(_, m):
     uid = m.from_user.id
-    if user_get(uid).get("is_banned"):
-        return
+    if user_get(uid).get("is_banned"): return
     path = os.path.join(THUMB_DIR, f"{uid}.jpg")
     await m.download(path)
     user_get(uid)["thumb"] = path
@@ -803,19 +748,16 @@ async def on_cb(_, cb):
     
     await cb.answer()
     
-    if user.get("is_banned"):
-        return
+    if user.get("is_banned"): return
     
     if data == "close":
-        try:
-            await cb.message.delete()
-        except:
-            pass
+        try: await cb.message.delete()
+        except: pass
         return
     
     if data == "check_join":
         if await is_subscribed(uid):
-            return await safe_edit(cb.message, "✅ **Verified!**", menu_kb(uid))
+            return await safe_edit(cb.message, "✅ Verified!", menu_kb(uid))
         return await cb.answer("❌ Not joined!", show_alert=True)
     
     if data == "cancel":
@@ -823,39 +765,35 @@ async def on_cb(_, cb):
             sess["cancel"] = True
             session_set(uid, sess)
             if sess.get("path") and os.path.exists(sess["path"]):
-                try:
-                    os.remove(sess["path"])
-                except:
-                    pass
+                try: os.remove(sess["path"])
+                except: pass
         session_clear(uid)
         user["state"] = "none"
         db_save()
-        return await safe_edit(cb.message, "❌ **Cancelled!**", None)
+        return await safe_edit(cb.message, "❌ Cancelled!", None)
     
     if data == "back":
         user["state"] = "none"
         db_save()
-        return await safe_edit(cb.message, "📋 **Menu**", menu_kb(uid))
+        return await safe_edit(cb.message, "📋 Menu", menu_kb(uid))
     
     # Menu
     if data == "menu_thumb":
-        return await safe_edit(cb.message, "🖼️ **Thumbnail**\n\nSend a photo.", thumb_kb())
+        return await safe_edit(cb.message, "🖼️ Send photo.", thumb_kb())
     
     if data == "menu_stats":
         if uid == OWNER_ID:
-            total = len(DB["users"])
-            pro = len([u for u in DB["users"].values() if u.get("is_pro")])
-            banned = len([u for u in DB["users"].values() if u.get("is_banned")])
-            return await safe_edit(cb.message, f"📊 **Bot Stats**\n\n👥 Users: {total}\n👑 Pro: {pro}\n🚫 Banned: {banned}", menu_kb(uid))
-        else:
-            used = user.get("used", 0)
-            rem = max(0, DAILY_LIMIT - used)
-            return await safe_edit(cb.message, f"📊 **Your Stats**\n\n📦 Used: {human_size(used)}\n📉 Left: {human_size(rem)}", menu_kb(uid))
+            return await safe_edit(cb.message, 
+                f"📊 **Stats**\n\n👥 {len(DB['users'])}\n🍪 {'✅' if COOKIES_PATH else '❌'}", 
+                menu_kb(uid))
+        used = user.get("used", 0)
+        return await safe_edit(cb.message, f"📊 Used: {human_size(used)}", menu_kb(uid))
     
     if data == "menu_help":
-        return await safe_edit(cb.message, "❓ **How to use:**\n\n1️⃣ Send video link\n2️⃣ Choose quality\n3️⃣ Wait for download\n4️⃣ Upload as File/Video\n\n💡 Send photo for thumbnail.", menu_kb(uid))
+        return await safe_edit(cb.message, 
+            "❓ Send link → Choose quality → Download → Upload", 
+            menu_kb(uid))
     
-    # Thumb
     if data == "thumb_view":
         t = user.get("thumb")
         if t and os.path.exists(t):
@@ -866,77 +804,73 @@ async def on_cb(_, cb):
     
     if data == "thumb_del":
         t = user.get("thumb")
-        if t and os.path.exists(t):
-            os.remove(t)
+        if t and os.path.exists(t): os.remove(t)
         user["thumb"] = None
         db_save()
         return await safe_edit(cb.message, "✅ Deleted!", thumb_kb())
     
     # Admin
     if data == "admin":
-        if uid != OWNER_ID:
-            return
-        return await safe_edit(cb.message, "⚙️ **Admin**", admin_kb())
+        if uid != OWNER_ID: return
+        return await safe_edit(cb.message, "⚙️ Admin", admin_kb())
     
     if data == "adm_stats":
-        if uid != OWNER_ID:
-            return
-        total = len(DB["users"])
-        pro = len([u for u in DB["users"].values() if u.get("is_pro")])
-        banned = len([u for u in DB["users"].values() if u.get("is_banned")])
-        return await safe_edit(cb.message, f"📊 **Stats**\n\n👥 {total}\n👑 {pro}\n🚫 {banned}", admin_kb())
+        if uid != OWNER_ID: return
+        return await safe_edit(cb.message, 
+            f"📊 Users: {len(DB['users'])}\n🍪 Cookies: {'✅ '+COOKIES_PATH if COOKIES_PATH else '❌ Not found'}", 
+            admin_kb())
+    
+    if data == "adm_cookies":
+        if uid != OWNER_ID: return
+        if COOKIES_PATH:
+            size = os.path.getsize(COOKIES_PATH)
+            return await safe_edit(cb.message, f"🍪 **Cookies**\n\n✅ `{COOKIES_PATH}`\n📦 {size} bytes", admin_kb())
+        return await safe_edit(cb.message, "🍪 **No cookies found!**\n\nAdd `cookies/cookies.txt`", admin_kb())
     
     if data == "adm_bc":
-        if uid != OWNER_ID:
-            return
+        if uid != OWNER_ID: return
         user["state"] = "broadcast"
         db_save()
         return await safe_edit(cb.message, "📢 Send message:", cancel_kb())
     
     if data == "bc_yes":
-        if uid != OWNER_ID:
-            return
+        if uid != OWNER_ID: return
         text = user.get("bc", "")
-        if not text:
-            return
+        if not text: return
         sent = 0
         for u in DB["users"]:
             if not DB["users"][u].get("is_banned"):
                 try:
                     await app.send_message(int(u), text)
                     sent += 1
-                except:
-                    pass
+                except: pass
         user["bc"] = ""
         db_save()
-        return await safe_edit(cb.message, f"✅ Sent to {sent}!", admin_kb())
+        return await safe_edit(cb.message, f"✅ Sent: {sent}", admin_kb())
     
     if data == "bc_cancel":
         user["state"] = "none"
         user["bc"] = ""
         db_save()
-        return await safe_edit(cb.message, "❌ Cancelled!", admin_kb())
+        return await safe_edit(cb.message, "❌", admin_kb())
     
     if data == "adm_pro":
-        if uid != OWNER_ID:
-            return
+        if uid != OWNER_ID: return
         user["state"] = "addpro"
         db_save()
-        return await safe_edit(cb.message, "👑 Send user ID:", cancel_kb())
+        return await safe_edit(cb.message, "👑 User ID:", cancel_kb())
     
     if data == "adm_ban":
-        if uid != OWNER_ID:
-            return
+        if uid != OWNER_ID: return
         user["state"] = "ban"
         db_save()
-        return await safe_edit(cb.message, "🚫 Send user ID:", cancel_kb())
+        return await safe_edit(cb.message, "🚫 User ID:", cancel_kb())
     
     if data == "adm_unban":
-        if uid != OWNER_ID:
-            return
+        if uid != OWNER_ID: return
         user["state"] = "unban"
         db_save()
-        return await safe_edit(cb.message, "✅ Send user ID:", cancel_kb())
+        return await safe_edit(cb.message, "✅ User ID:", cancel_kb())
     
     # YouTube
     if data.startswith("yt_"):
@@ -946,59 +880,51 @@ async def on_cb(_, cb):
         quality = data.replace("yt_", "")
         
         try:
-            await safe_edit(cb.message, f"⬇️ **Downloading {quality}...**", cancel_kb())
+            await safe_edit(cb.message, f"⬇️ **{quality}...**", cancel_kb())
             path, title = await download_video(uid, sess["url"], cb.message, quality)
             name = os.path.basename(path)
             size = os.path.getsize(path)
             session_set(uid, {"url": sess["url"], "path": path, "name": name, "ext": get_ext(name), "size": size, "cancel": False})
-            await safe_edit(cb.message, f"✅ **Done!**\n\n📄 `{name}`\n📦 {human_size(size)}", upload_kb())
+            await safe_edit(cb.message, f"✅ `{name}`\n📦 {human_size(size)}", upload_kb())
         except Exception as e:
             session_clear(uid)
-            msg = "❌ Cancelled!" if "CANCELLED" in str(e) else f"❌ {str(e)[:200]}"
-            await safe_edit(cb.message, msg, None)
+            await safe_edit(cb.message, f"❌ {str(e)[:200]}" if "CANCELLED" not in str(e) else "❌ Cancelled!", None)
         return
     
     # Rename
     if data == "rename":
         if sess:
-            return await safe_edit(cb.message, f"✏️ **Rename**\n\n`{sess['name']}`", rename_kb())
-        return
+            return await safe_edit(cb.message, f"✏️ `{sess['name']}`", rename_kb())
     
     if data == "ren_def":
         if sess:
             return await safe_edit(cb.message, f"📝 `{sess['name']}`", upload_kb())
-        return
     
     if data == "ren_cust":
         if sess:
             user["state"] = "rename"
             db_save()
-            return await safe_edit(cb.message, "✏️ Send new name:", cancel_kb())
-        return
+            return await safe_edit(cb.message, "✏️ New name:", cancel_kb())
     
     if data == "back_up":
         if sess:
             return await safe_edit(cb.message, f"📄 `{sess['name']}`", upload_kb())
-        return
     
     # Upload
     if data in ["up_file", "up_video"]:
         if not sess or not sess.get("path") or not os.path.exists(sess["path"]):
             session_clear(uid)
-            return await safe_edit(cb.message, "❌ File missing!", None)
+            return await safe_edit(cb.message, "❌ Missing!", None)
         
         try:
             await safe_edit(cb.message, "📤 **Uploading...**", cancel_kb())
             await do_upload(uid, cb.message, sess["path"], sess["name"], data == "up_video")
-            try:
-                os.remove(sess["path"])
-            except:
-                pass
+            try: os.remove(sess["path"])
+            except: pass
             session_clear(uid)
-            await safe_edit(cb.message, "✅ **Done!**", menu_kb(uid))
+            await safe_edit(cb.message, "✅ Done!", menu_kb(uid))
         except Exception as e:
-            msg = "❌ Cancelled!" if "CANCELLED" in str(e) else f"❌ {str(e)[:80]}"
-            await safe_edit(cb.message, msg, None)
+            await safe_edit(cb.message, f"❌ {str(e)[:80]}" if "CANCELLED" not in str(e) else "❌", None)
 
 # =======================
 # MAIN
@@ -1011,17 +937,13 @@ async def main():
     os.makedirs(THUMB_DIR, exist_ok=True)
     db_load()
     
-    # Check cookies
-    for p in [COOKIES_FILE, "cookies/cookies.txt", "cookies.txt"]:
-        if os.path.exists(p):
-            print(f"✅ Cookies found: {p}")
-            break
-    else:
-        print("⚠️ No cookies (optional)")
+    # FIND COOKIES ON STARTUP
+    find_cookies()
     
     await app.start()
     print("✅ Bot started!")
     print(f"👥 Users: {len(DB['users'])}")
+    print(f"🍪 Cookies: {COOKIES_PATH or 'NOT FOUND'}")
     
     srv = web.Application()
     srv.add_routes([web.get("/", health)])
