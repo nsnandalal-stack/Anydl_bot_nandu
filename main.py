@@ -15,10 +15,42 @@ from yt_dlp import YoutubeDL
 # =======================
 OWNER_ID = 519459195
 
-API_ID = int(os.getenv("API_ID", "0"))
-API_HASH = os.getenv("API_HASH", "")
-BOT_TOKEN = os.getenv("BOT_TOKEN", "")
-CHANNEL_ID = int(os.getenv("CHANNEL_ID", "0"))
+# Get environment variables
+API_ID = os.getenv("API_ID")
+API_HASH = os.getenv("API_HASH")
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+CHANNEL_ID = os.getenv("CHANNEL_ID")
+
+# Debug: Print what we got
+print("=" * 60)
+print("🔍 ENVIRONMENT VARIABLES CHECK")
+print(f"API_ID: {API_ID}")
+print(f"API_HASH: {'*' * len(API_HASH) if API_HASH else 'NOT SET'}")
+print(f"BOT_TOKEN: {'SET ✅' if BOT_TOKEN else 'NOT SET ❌'}")
+print(f"CHANNEL_ID: {CHANNEL_ID}")
+print("=" * 60)
+
+# Validate required variables
+if not API_ID or not API_HASH or not BOT_TOKEN or not CHANNEL_ID:
+    print("\n❌ ERROR: MISSING ENVIRONMENT VARIABLES!")
+    print("\nRequired variables:")
+    print("  • API_ID      (from https://my.telegram.org)")
+    print("  • API_HASH    (from https://my.telegram.org)")
+    print("  • BOT_TOKEN   (from @BotFather)")
+    print("  • CHANNEL_ID  (your channel ID)")
+    print("\nAdd these in your hosting dashboard (Emergent/Railway)")
+    print("Then redeploy the application.\n")
+    exit(1)
+
+# Convert to correct types
+try:
+    API_ID = int(API_ID)
+    CHANNEL_ID = int(CHANNEL_ID)
+    print("✅ Environment variables validated successfully!\n")
+except ValueError as e:
+    print(f"❌ ERROR: API_ID and CHANNEL_ID must be numbers!")
+    print(f"Current values - API_ID: {API_ID}, CHANNEL_ID: {CHANNEL_ID}\n")
+    exit(1)
 
 INVITE_LINK = "https://t.me/+eooytvOAwjc0NTI1"
 DOWNLOAD_DIR = "/tmp/downloads"
@@ -67,7 +99,8 @@ def find_cookies():
             except Exception as e:
                 print(f"❌ Error reading {path}: {e}")
     
-    print("⚠️ NO COOKIES FOUND - Some downloads may fail")
+    print("⚠️  NO COOKIES FOUND - Some downloads may fail")
+    print("   Add cookies.txt to enable restricted content downloads")
     return None
 
 # =======================
@@ -367,7 +400,6 @@ async def download_ytdlp(uid: int, url: str, msg, quality: str = "720"):
         "nocheckcertificate": True,
         "geo_bypass": True,
         "geo_bypass_country": "US",
-        # CRITICAL: Better extractor arguments
         "extractor_args": {
             "youtube": {
                 "player_client": ["ios", "android", "web", "tv_embedded"],
@@ -378,7 +410,6 @@ async def download_ytdlp(uid: int, url: str, msg, quality: str = "720"):
                 "include_stories": False,
             }
         },
-        # CRITICAL: Proper headers
         "http_headers": {
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
             "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
@@ -401,7 +432,6 @@ async def download_ytdlp(uid: int, url: str, msg, quality: str = "720"):
     
     # Format selection
     if quality.startswith("mp3"):
-        # High-quality audio extraction
         bitrate = "320" if quality == "mp3_320" else "192"
         opts["format"] = "bestaudio[ext=m4a]/bestaudio/best"
         opts["postprocessors"] = [{
@@ -411,9 +441,7 @@ async def download_ytdlp(uid: int, url: str, msg, quality: str = "720"):
         }]
     else:
         target = int(quality) if quality.isdigit() else 720
-        # IMPROVED format selection for better quality
         if target >= 1080:
-            # For 1080p, get best video+audio
             opts["format"] = (
                 "bestvideo[height<=1080][ext=mp4]+bestaudio[ext=m4a]/"
                 "bestvideo[height<=1080]+bestaudio/"
@@ -421,14 +449,12 @@ async def download_ytdlp(uid: int, url: str, msg, quality: str = "720"):
                 "best"
             )
         else:
-            # For other qualities
             opts["format"] = (
                 f"bestvideo[height<={target}][ext=mp4]+bestaudio[ext=m4a]/"
                 f"bestvideo[height<={target}]+bestaudio/"
                 f"best[height<={target}]/"
                 "best"
             )
-        # Merge video+audio into single file
         opts["merge_output_format"] = "mp4"
     
     loop = asyncio.get_event_loop()
@@ -444,7 +470,7 @@ async def download_ytdlp(uid: int, url: str, msg, quality: str = "720"):
     return await loop.run_in_executor(None, do_dl)
 
 # =======================
-# COBALT API (NEW METHOD)
+# COBALT API
 # =======================
 async def download_cobalt(uid: int, url: str, msg, quality: str = "720"):
     """Download using Cobalt API - works without cookies!"""
@@ -458,7 +484,6 @@ async def download_cobalt(uid: int, url: str, msg, quality: str = "720"):
     
     timeout = ClientTimeout(total=60)
     
-    # Handle audio quality
     is_audio_only = quality.startswith("mp3")
     audio_bitrate = "320" if quality == "mp3_320" else "192"
     
@@ -502,21 +527,20 @@ async def download_video(uid: int, url: str, msg, quality: str = "720"):
     
     errors = []
     
-    # Method 1: Cobalt (NO COOKIES NEEDED - BEST FOR YOUTUBE/INSTAGRAM)
+    # Method 1: Cobalt
     try:
         return await download_cobalt(uid, url, msg, quality)
     except Exception as e:
         if "CANCELLED" in str(e): raise
         errors.append(f"Cobalt: {str(e)[:50]}")
     
-    # Method 2: yt-dlp (with cookies if available)
+    # Method 2: yt-dlp
     try:
         return await download_ytdlp(uid, url, msg, quality)
     except Exception as e:
         if "CANCELLED" in str(e): raise
         errors.append(f"yt-dlp: {str(e)[:50]}")
     
-    # All failed
     raise Exception("All methods failed:\n" + "\n".join(errors[:3]))
 
 # =======================
@@ -595,9 +619,15 @@ async def do_upload(uid, msg, path, name, as_video):
         db_save()
 
 # =======================
-# BOT
+# BOT INITIALIZATION
 # =======================
-app = Client("bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
+app = Client(
+    name="bot",
+    api_id=API_ID,
+    api_hash=API_HASH,
+    bot_token=BOT_TOKEN,
+    workdir="/app"
+)
 
 @app.on_message(filters.command("start") & filters.private)
 async def cmd_start(_, m):
@@ -670,312 +700,4 @@ async def on_text(_, m):
     if not text.startswith("http"): return
     
     if not await is_subscribed(uid):
-        return await m.reply_text("⚠️ **Join channel!**", reply_markup=join_kb())
-    
-    status = await m.reply_text("🔍 **Analyzing...**", reply_markup=cancel_kb())
-    session_set(uid, {"url": text, "cancel": False})
-    
-    if is_yt(text) or is_instagram(text):
-        platform = "🎬 YouTube" if is_yt(text) else "📸 Instagram"
-        return await safe_edit(status, f"{platform}\n\nChoose quality:", yt_kb())
-    
-    try:
-        await safe_edit(status, "⬇️ **Downloading...**", cancel_kb())
-        path, title = await download_direct(uid, text, status)
-        
-        name = os.path.basename(path)
-        size = os.path.getsize(path)
-        session_set(uid, {"url": text, "path": path, "name": name, "ext": get_ext(name), "size": size, "cancel": False})
-        await safe_edit(status, f"✅ **Done!**\n\n📄 `{name}`\n📦 {human_size(size)}", upload_kb())
-    except Exception as e:
-        session_clear(uid)
-        await safe_edit(status, f"❌ {str(e)[:200]}" if "CANCELLED" not in str(e) else "❌ Cancelled!", None)
-
-@app.on_message((filters.video | filters.document | filters.audio) & filters.private)
-async def on_file(_, m):
-    uid = m.from_user.id
-    if user_get(uid).get("is_banned"): return
-    if not await is_subscribed(uid):
-        return await m.reply_text("⚠️ Join!", reply_markup=join_kb())
-    
-    media = m.video or m.document or m.audio
-    status = await m.reply_text("⬇️ **Downloading...**", reply_markup=cancel_kb())
-    session_set(uid, {"cancel": False})
-    
-    try:
-        name = safe_name(getattr(media, "file_name", None) or f"file_{int(time.time())}")
-        path = os.path.join(DOWNLOAD_DIR, name)
-        await m.download(path)
-        size = os.path.getsize(path)
-        session_set(uid, {"path": path, "name": name, "ext": get_ext(name), "size": size, "cancel": False})
-        await safe_edit(status, f"✅ `{name}`\n📦 {human_size(size)}", upload_kb())
-    except Exception as e:
-        session_clear(uid)
-        await safe_edit(status, f"❌ {str(e)[:80]}", None)
-
-@app.on_message(filters.photo & filters.private)
-async def on_photo(_, m):
-    uid = m.from_user.id
-    if user_get(uid).get("is_banned"): return
-    path = os.path.join(THUMB_DIR, f"{uid}.jpg")
-    await m.download(path)
-    user_get(uid)["thumb"] = path
-    db_save()
-    await m.reply_text("✅ **Thumbnail saved!**")
-
-@app.on_callback_query()
-async def on_cb(_, cb):
-    uid = cb.from_user.id
-    data = cb.data
-    user = user_get(uid)
-    sess = session_get(uid)
-    
-    await cb.answer()
-    
-    if user.get("is_banned"): return
-    
-    if data == "close":
-        try: await cb.message.delete()
-        except: pass
-        return
-    
-    if data == "check_join":
-        if await is_subscribed(uid):
-            return await safe_edit(cb.message, "✅ Verified!", menu_kb(uid))
-        return await cb.answer("❌ Not joined!", show_alert=True)
-    
-    if data == "cancel":
-        if sess:
-            sess["cancel"] = True
-            session_set(uid, sess)
-            if sess.get("path") and os.path.exists(sess["path"]):
-                try: os.remove(sess["path"])
-                except: pass
-        session_clear(uid)
-        user["state"] = "none"
-        db_save()
-        return await safe_edit(cb.message, "❌ Cancelled!", None)
-    
-    if data == "back":
-        user["state"] = "none"
-        db_save()
-        return await safe_edit(cb.message, "📋 Menu", menu_kb(uid))
-    
-    # Menu
-    if data == "menu_thumb":
-        return await safe_edit(cb.message, "🖼️ Send a photo to set as thumbnail", thumb_kb())
-    
-    if data == "menu_stats":
-        if uid == OWNER_ID:
-            cookie_status = "✅ " + COOKIES_PATH if COOKIES_PATH else "❌ Not found"
-            return await safe_edit(cb.message, 
-                f"📊 **Bot Stats**\n\n👥 Users: {len(DB['users'])}\n🍪 Cookies: {cookie_status}", 
-                menu_kb(uid))
-        used = user.get("used", 0)
-        return await safe_edit(cb.message, f"📊 Used today: {human_size(used)}", menu_kb(uid))
-    
-    if data == "menu_help":
-        return await safe_edit(cb.message, 
-            "❓ **How to use:**\n\n"
-            "1. Send YouTube/Instagram link\n"
-            "2. Choose quality\n"
-            "3. Wait for download\n"
-            "4. Upload as file or video\n\n"
-            "Supported: YouTube, Instagram, and direct links", 
-            menu_kb(uid))
-    
-    if data == "thumb_view":
-        t = user.get("thumb")
-        if t and os.path.exists(t):
-            await cb.message.reply_photo(t)
-        else:
-            await cb.answer("No thumbnail set!", show_alert=True)
-        return
-    
-    if data == "thumb_del":
-        t = user.get("thumb")
-        if t and os.path.exists(t): os.remove(t)
-        user["thumb"] = None
-        db_save()
-        return await safe_edit(cb.message, "✅ Deleted!", thumb_kb())
-    
-    # Admin
-    if data == "admin":
-        if uid != OWNER_ID: return
-        return await safe_edit(cb.message, "⚙️ Admin Panel", admin_kb())
-    
-    if data == "adm_stats":
-        if uid != OWNER_ID: return
-        cookie_status = f"✅ {COOKIES_PATH}" if COOKIES_PATH else "❌ Not found"
-        return await safe_edit(cb.message, 
-            f"📊 **Statistics**\n\n"
-            f"👥 Total users: {len(DB['users'])}\n"
-            f"🍪 Cookies: {cookie_status}", 
-            admin_kb())
-    
-    if data == "adm_cookies":
-        if uid != OWNER_ID: return
-        if COOKIES_PATH and os.path.exists(COOKIES_PATH):
-            size = os.path.getsize(COOKIES_PATH)
-            return await safe_edit(cb.message, 
-                f"🍪 **Cookies Info**\n\n"
-                f"✅ Found\n"
-                f"📂 `{COOKIES_PATH}`\n"
-                f"📦 {size} bytes\n\n"
-                f"ℹ️ Update cookies if downloads fail", 
-                admin_kb())
-        return await safe_edit(cb.message, 
-            "🍪 **No Cookies Found**\n\n"
-            "Add cookies.txt to /app/cookies/ folder\n\n"
-            "Get cookies from:\n"
-            "• YouTube (logged in)\n"
-            "• Instagram (logged in)", 
-            admin_kb())
-    
-    if data == "adm_bc":
-        if uid != OWNER_ID: return
-        user["state"] = "broadcast"
-        db_save()
-        return await safe_edit(cb.message, "📢 Send broadcast message:", cancel_kb())
-    
-    if data == "bc_yes":
-        if uid != OWNER_ID: return
-        text = user.get("bc", "")
-        if not text: return
-        sent = 0
-        for u in DB["users"]:
-            if not DB["users"][u].get("is_banned"):
-                try:
-                    await app.send_message(int(u), text)
-                    sent += 1
-                    await asyncio.sleep(0.05)
-                except: pass
-        user["bc"] = ""
-        db_save()
-        return await safe_edit(cb.message, f"✅ Broadcast sent to {sent} users!", admin_kb())
-    
-    if data == "bc_cancel":
-        user["state"] = "none"
-        user["bc"] = ""
-        db_save()
-        return await safe_edit(cb.message, "❌ Cancelled", admin_kb())
-    
-    if data == "adm_pro":
-        if uid != OWNER_ID: return
-        user["state"] = "addpro"
-        db_save()
-        return await safe_edit(cb.message, "👑 Send user ID to give PRO:", cancel_kb())
-    
-    if data == "adm_ban":
-        if uid != OWNER_ID: return
-        user["state"] = "ban"
-        db_save()
-        return await safe_edit(cb.message, "🚫 Send user ID to ban:", cancel_kb())
-    
-    if data == "adm_unban":
-        if uid != OWNER_ID: return
-        user["state"] = "unban"
-        db_save()
-        return await safe_edit(cb.message, "✅ Send user ID to unban:", cancel_kb())
-    
-    # YouTube/Instagram quality selection
-    if data.startswith("yt_"):
-        if not sess or not sess.get("url"):
-            return await safe_edit(cb.message, "❌ Session expired!", None)
-        
-        quality = data.replace("yt_", "")
-        
-        # Format quality display
-        quality_display = quality.upper()
-        if quality == "mp3":
-            quality_display = "MP3 192kbps"
-        elif quality == "mp3_320":
-            quality_display = "MP3 320kbps"
-        elif quality.isdigit():
-            quality_display = f"{quality}p"
-        
-        try:
-            await safe_edit(cb.message, f"⬇️ **Downloading {quality_display}...**", cancel_kb())
-            path, title = await download_video(uid, sess["url"], cb.message, quality)
-            name = os.path.basename(path)
-            size = os.path.getsize(path)
-            session_set(uid, {"url": sess["url"], "path": path, "name": name, "ext": get_ext(name), "size": size, "cancel": False})
-            await safe_edit(cb.message, f"✅ **Done!**\n\n📄 `{name}`\n📦 {human_size(size)}", upload_kb())
-        except Exception as e:
-            session_clear(uid)
-            error_msg = str(e)
-            if "CANCELLED" in error_msg:
-                await safe_edit(cb.message, "❌ Cancelled!", None)
-            else:
-                await safe_edit(cb.message, f"❌ **Failed**\n\n{error_msg[:200]}", None)
-        return
-    
-    # Rename
-    if data == "rename":
-        if sess:
-            return await safe_edit(cb.message, f"✏️ Current: `{sess['name']}`", rename_kb())
-    
-    if data == "ren_def":
-        if sess:
-            return await safe_edit(cb.message, f"📝 `{sess['name']}`", upload_kb())
-    
-    if data == "ren_cust":
-        if sess:
-            user["state"] = "rename"
-            db_save()
-            return await safe_edit(cb.message, "✏️ Send new filename (without extension):", cancel_kb())
-    
-    if data == "back_up":
-        if sess:
-            return await safe_edit(cb.message, f"📄 `{sess['name']}`\n📦 {human_size(sess.get('size', 0))}", upload_kb())
-    
-    # Upload
-    if data in ["up_file", "up_video"]:
-        if not sess or not sess.get("path") or not os.path.exists(sess["path"]):
-            session_clear(uid)
-            return await safe_edit(cb.message, "❌ File not found!", None)
-        
-        try:
-            await safe_edit(cb.message, "📤 **Uploading...**", cancel_kb())
-            await do_upload(uid, cb.message, sess["path"], sess["name"], data == "up_video")
-            try: os.remove(sess["path"])
-            except: pass
-            session_clear(uid)
-            await safe_edit(cb.message, "✅ **Upload complete!**", menu_kb(uid))
-        except Exception as e:
-            error_msg = str(e)
-            if "CANCELLED" not in error_msg:
-                await safe_edit(cb.message, f"❌ {error_msg[:100]}", None)
-            else:
-                await safe_edit(cb.message, "❌ Cancelled!", None)
-
-# =======================
-# MAIN
-# =======================
-async def health(_):
-    return web.Response(text="OK")
-
-async def main():
-    os.makedirs(DOWNLOAD_DIR, exist_ok=True)
-    os.makedirs(THUMB_DIR, exist_ok=True)
-    db_load()
-    
-    # Find cookies on startup
-    find_cookies()
-    
-    await app.start()
-    print("✅ Bot started!")
-    print(f"👥 Users: {len(DB['users'])}")
-    print(f"🍪 Cookies: {COOKIES_PATH or 'NOT FOUND (some features may be limited)'}")
-    
-    srv = web.Application()
-    srv.add_routes([web.get("/", health)])
-    runner = web.AppRunner(srv)
-    await runner.setup()
-    await web.TCPSite(runner, "0.0.0.0", 8000).start()
-    
-    await idle()
-    await app.stop()
-
-if __name__ == "__main__":
-    app.run(main())
+        return await m.reply_text("⚠️ **Join 
