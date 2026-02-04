@@ -4,6 +4,7 @@ import time
 import json
 import shutil
 import asyncio
+import random
 from datetime import date
 from aiohttp import web, ClientSession, ClientTimeout
 
@@ -19,7 +20,6 @@ API_ID = os.getenv("API_ID")
 API_HASH = os.getenv("API_HASH")
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 CHANNEL_ID = os.getenv("CHANNEL_ID")
-YOUTUBE_API_KEY = os.getenv("YOUTUBE_API_KEY")  # YouTube Data API v3 Key
 
 print("=" * 60)
 print("🔍 ENVIRONMENT VARIABLES CHECK")
@@ -27,13 +27,10 @@ print(f"API_ID: {API_ID}")
 print(f"API_HASH: {'SET ✅' if API_HASH else 'NOT SET ❌'}")
 print(f"BOT_TOKEN: {'SET ✅' if BOT_TOKEN else 'NOT SET ❌'}")
 print(f"CHANNEL_ID: {CHANNEL_ID}")
-print(f"YOUTUBE_API_KEY: {'SET ✅' if YOUTUBE_API_KEY else 'NOT SET ⚠️ (will use fallback methods)'}")
 print("=" * 60)
 
 if not API_ID or not API_HASH or not BOT_TOKEN or not CHANNEL_ID:
-    print("\n❌ ERROR: MISSING REQUIRED ENVIRONMENT VARIABLES!")
-    print("Required: API_ID, API_HASH, BOT_TOKEN, CHANNEL_ID")
-    print("Optional: YOUTUBE_API_KEY")
+    print("\n❌ ERROR: MISSING ENVIRONMENT VARIABLES!")
     exit(1)
 
 try:
@@ -49,6 +46,21 @@ DOWNLOAD_DIR = "/tmp/downloads"
 THUMB_DIR = "/tmp/thumbnails"
 DB_FILE = "/tmp/bot_db.json"
 DAILY_LIMIT = 5 * 1024 * 1024 * 1024
+
+# =======================
+# COOKIES (Auto-detect)
+# =======================
+COOKIES_PATH = None
+
+def find_cookies():
+    global COOKIES_PATH
+    paths = ["/app/cookies.txt", "cookies.txt", "/app/cookies/cookies.txt"]
+    for p in paths:
+        if os.path.exists(p):
+            COOKIES_PATH = p
+            print(f"✅ Cookies found: {p}")
+            return
+    print("⚠️ No cookies.txt found - some videos may fail")
 
 # =======================
 # DATABASE
@@ -80,7 +92,9 @@ def user_get(uid: int) -> dict:
             "used": 0,
             "reset": date.today().isoformat(),
             "is_pro": (uid == OWNER_ID),
-            "is_banned": False
+            "is_banned": False,
+            "verified": False,
+            "verify_answer": None
         }
     if DB["users"][k].get("reset") != date.today().isoformat():
         DB["users"][k]["reset"] = date.today().isoformat()
@@ -100,6 +114,57 @@ def session_clear(uid: int):
     db_save()
 
 # =======================
+# HUMAN VERIFICATION
+# =======================
+def generate_captcha():
+    a = random.randint(1, 20)
+    b = random.randint(1, 20)
+    op = random.choice(['+', '-', 'x'])
+    
+    if op == '+':
+        answer = a + b
+        question = f"{a} + {b}"
+    elif op == '-':
+        if a < b:
+            a, b = b, a
+        answer = a - b
+        question = f"{a} - {b}"
+    else:
+        a = random.randint(1, 10)
+        b = random.randint(1, 10)
+        answer = a * b
+        question = f"{a} x {b}"
+    
+    return question, answer
+
+def generate_verify_keyboard(correct_answer):
+    wrong_answers = set()
+    while len(wrong_answers) < 3:
+        offset = random.randint(-5, 5)
+        if offset == 0:
+            offset = random.choice([-1, 1])
+        wrong = correct_answer + offset
+        if wrong != correct_answer and wrong >= 0:
+            wrong_answers.add(wrong)
+    
+    all_answers = list(wrong_answers) + [correct_answer]
+    random.shuffle(all_answers)
+    
+    row = []
+    for ans in all_answers:
+        row.append(types.InlineKeyboardButton(str(ans), callback_data=f"verify_{ans}"))
+    
+    return types.InlineKeyboardMarkup([
+        row,
+        [types.InlineKeyboardButton("🔄 New Question", callback_data="verify_new")]
+    ])
+
+def is_verified(uid: int) -> bool:
+    if uid == OWNER_ID:
+        return True
+    return user_get(uid).get("verified", False)
+
+# =======================
 # HELPERS
 # =======================
 def safe_name(n: str) -> str:
@@ -113,18 +178,6 @@ def is_yt(url: str) -> bool:
 
 def is_instagram(url: str) -> bool:
     return "instagram.com" in url.lower()
-
-def extract_video_id(url: str) -> str:
-    """Extract YouTube video ID from URL"""
-    if "youtu.be/" in url:
-        return url.split("youtu.be/")[1].split("?")[0].split("/")[0]
-    elif "v=" in url:
-        return url.split("v=")[1].split("&")[0]
-    elif "/shorts/" in url:
-        return url.split("/shorts/")[1].split("?")[0]
-    elif "/embed/" in url:
-        return url.split("/embed/")[1].split("?")[0]
-    return ""
 
 def human_size(n) -> str:
     if not n:
@@ -156,7 +209,6 @@ async def safe_edit(msg, text, kb=None):
         return msg
 
 async def is_subscribed(uid: int) -> bool:
-    """Check if user is subscribed to channel"""
     if uid == OWNER_ID:
         return True
     try:
@@ -171,7 +223,7 @@ async def is_subscribed(uid: int) -> bool:
 def join_kb():
     return types.InlineKeyboardMarkup([
         [types.InlineKeyboardButton("📢 Join Channel", url=INVITE_LINK)],
-        [types.InlineKeyboardButton("✅ Verify", callback_data="verify_join")]
+        [types.InlineKeyboardButton("✅ I've Joined", callback_data="check_join")]
     ])
 
 def cancel_kb():
@@ -229,7 +281,8 @@ def admin_kb():
          types.InlineKeyboardButton("📢 Broadcast", callback_data="adm_bc")],
         [types.InlineKeyboardButton("👑 Pro", callback_data="adm_pro"),
          types.InlineKeyboardButton("🚫 Ban", callback_data="adm_ban")],
-        [types.InlineKeyboardButton("✅ Unban", callback_data="adm_unban")],
+        [types.InlineKeyboardButton("✅ Unban", callback_data="adm_unban"),
+         types.InlineKeyboardButton("🔓 Reset Verify", callback_data="adm_resetverify")],
         [types.InlineKeyboardButton("🔙 Back", callback_data="back")]
     ])
 
@@ -240,73 +293,7 @@ def bc_kb():
     ])
 
 # =======================
-# YOUTUBE DATA API v3
-# =======================
-async def get_youtube_video_info(video_id: str) -> dict:
-    """Get video info using YouTube Data API v3"""
-    if not YOUTUBE_API_KEY:
-        return None
-    
-    try:
-        url = (
-            f"https://www.googleapis.com/youtube/v3/videos"
-            f"?part=snippet,contentDetails,statistics"
-            f"&id={video_id}"
-            f"&key={YOUTUBE_API_KEY}"
-        )
-        
-        timeout = ClientTimeout(total=10)
-        async with ClientSession(timeout=timeout) as session:
-            async with session.get(url) as resp:
-                if resp.status != 200:
-                    print(f"YouTube API error: {resp.status}")
-                    return None
-                
-                data = await resp.json()
-                
-                if not data.get("items"):
-                    return None
-                
-                item = data["items"][0]
-                snippet = item.get("snippet", {})
-                content = item.get("contentDetails", {})
-                stats = item.get("statistics", {})
-                
-                # Parse duration (ISO 8601 format: PT1H2M3S)
-                duration_str = content.get("duration", "PT0S")
-                duration = 0
-                if "H" in duration_str:
-                    hours = int(duration_str.split("H")[0].split("T")[1])
-                    duration += hours * 3600
-                    duration_str = duration_str.split("H")[1]
-                else:
-                    duration_str = duration_str.split("T")[1] if "T" in duration_str else duration_str
-                if "M" in duration_str:
-                    minutes = int(duration_str.split("M")[0])
-                    duration += minutes * 60
-                    duration_str = duration_str.split("M")[1]
-                if "S" in duration_str:
-                    seconds = int(duration_str.replace("S", ""))
-                    duration += seconds
-                
-                return {
-                    "id": video_id,
-                    "title": snippet.get("title", "Unknown"),
-                    "channel": snippet.get("channelTitle", "Unknown"),
-                    "duration": duration,
-                    "duration_str": human_time(duration),
-                    "thumbnail": snippet.get("thumbnails", {}).get("high", {}).get("url"),
-                    "views": int(stats.get("viewCount", 0)),
-                    "likes": int(stats.get("likeCount", 0)),
-                    "description": snippet.get("description", "")[:200]
-                }
-    
-    except Exception as e:
-        print(f"YouTube API error: {e}")
-        return None
-
-# =======================
-# DOWNLOAD FUNCTIONS
+# DOWNLOAD HELPER
 # =======================
 async def download_from_url(uid: int, url: str, msg, filename: str = None, quality: str = "720"):
     start_time = time.time()
@@ -375,10 +362,11 @@ async def download_from_url(uid: int, url: str, msg, filename: str = None, quali
                 continue
             raise
 
-async def download_ytdlp(uid: int, url: str, msg, quality: str = "720", video_info: dict = None):
-    """Download using yt-dlp"""
-    title = video_info.get("title", "Video") if video_info else "Video"
-    await safe_edit(msg, f"🔄 **Downloading:** {title[:50]}...", cancel_kb())
+# =======================
+# YT-DLP DOWNLOAD (IMPROVED)
+# =======================
+async def download_ytdlp(uid: int, url: str, msg, quality: str = "720"):
+    await safe_edit(msg, "🔄 **Downloading...**", cancel_kb())
     
     start_time = time.time()
     last = {"t": 0}
@@ -421,6 +409,7 @@ async def download_ytdlp(uid: int, url: str, msg, quality: str = "720", video_in
         "nocheckcertificate": True,
         "geo_bypass": True,
         "geo_bypass_country": "US",
+        # IMPORTANT: Use these clients to bypass bot detection
         "extractor_args": {
             "youtube": {
                 "player_client": ["android", "web"],
@@ -429,8 +418,15 @@ async def download_ytdlp(uid: int, url: str, msg, quality: str = "720", video_in
         },
         "http_headers": {
             "User-Agent": "com.google.android.youtube/17.36.4 (Linux; U; Android 12; GB) gzip",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Accept-Language": "en-us,en;q=0.5",
+            "Sec-Fetch-Mode": "navigate",
         }
     }
+    
+    # Add cookies if available
+    if COOKIES_PATH and os.path.exists(COOKIES_PATH):
+        opts["cookiefile"] = COOKIES_PATH
     
     if quality.startswith("mp3"):
         bitrate = "320" if quality == "mp3_320" else "192"
@@ -457,20 +453,31 @@ async def download_ytdlp(uid: int, url: str, msg, quality: str = "720", video_in
     
     return await loop.run_in_executor(None, do_dl)
 
-async def download_invidious(uid: int, url: str, msg, quality: str = "720", video_info: dict = None):
-    """Download using Invidious API"""
-    video_id = extract_video_id(url)
+# =======================
+# INVIDIOUS API (New method - no cookies needed!)
+# =======================
+async def download_invidious(uid: int, url: str, msg, quality: str = "720"):
+    await safe_edit(msg, "🔄 **Method: Invidious...**", cancel_kb())
+    
+    # Extract video ID
+    video_id = None
+    if "youtu.be/" in url:
+        video_id = url.split("youtu.be/")[1].split("?")[0]
+    elif "v=" in url:
+        video_id = url.split("v=")[1].split("&")[0]
+    elif "/shorts/" in url:
+        video_id = url.split("/shorts/")[1].split("?")[0]
+    
     if not video_id:
         raise Exception("Invalid YouTube URL")
     
-    title = video_info.get("title", "Video") if video_info else "Video"
-    await safe_edit(msg, f"🔄 **Fetching:** {title[:50]}...", cancel_kb())
-    
+    # Invidious instances
     instances = [
         "https://inv.nadeko.net",
         "https://invidious.nerdvpn.de",
         "https://invidious.jing.rocks",
         "https://yt.artemislena.eu",
+        "https://invidious.privacydev.net",
     ]
     
     timeout = ClientTimeout(total=30)
@@ -489,6 +496,7 @@ async def download_invidious(uid: int, url: str, msg, quality: str = "720", vide
                     title = data.get("title", "video")
                     
                     if is_audio:
+                        # Get audio stream
                         streams = data.get("adaptiveFormats", [])
                         audio_streams = [s for s in streams if s.get("type", "").startswith("audio")]
                         if audio_streams:
@@ -498,9 +506,11 @@ async def download_invidious(uid: int, url: str, msg, quality: str = "720", vide
                                 filename = f"{safe_name(title)}.mp3"
                                 return await download_from_url(uid, stream_url, msg, filename, quality)
                     else:
+                        # Get video stream
                         target = int(quality) if quality.isdigit() else 720
                         streams = data.get("formatStreams", [])
                         
+                        # Find best matching quality
                         best_stream = None
                         for s in streams:
                             res = s.get("resolution", "")
@@ -518,18 +528,22 @@ async def download_invidious(uid: int, url: str, msg, quality: str = "720", vide
                             if stream_url:
                                 filename = f"{safe_name(title)}.mp4"
                                 return await download_from_url(uid, stream_url, msg, filename, quality)
-        except:
+        
+        except Exception as e:
             continue
     
     raise Exception("Invidious failed")
 
+# =======================
+# COBALT API
+# =======================
 async def download_cobalt(uid: int, url: str, msg, quality: str = "720"):
-    """Download using Cobalt API"""
     await safe_edit(msg, "🔄 **Method: Cobalt...**", cancel_kb())
     
     cobalt_instances = [
         "https://co.wuk.sh",
         "https://cobalt-api.kwiatekmiki.com",
+        "https://cobalt.api.timelessnesses.me",
     ]
     
     timeout = ClientTimeout(total=60)
@@ -565,23 +579,16 @@ async def download_cobalt(uid: int, url: str, msg, quality: str = "720"):
     
     raise Exception("Cobalt failed")
 
+# =======================
+# MAIN DOWNLOAD (Try all methods)
+# =======================
 async def download_video(uid: int, url: str, msg, quality: str = "720"):
-    """Main download function - tries all methods"""
     errors_list = []
-    video_info = None
     
-    # Get video info using YouTube API if available
-    if is_yt(url) and YOUTUBE_API_KEY:
-        video_id = extract_video_id(url)
-        if video_id:
-            video_info = await get_youtube_video_info(video_id)
-            if video_info:
-                print(f"📺 YouTube API: {video_info['title']}")
-    
-    # Method 1: Invidious (for YouTube)
+    # Method 1: Invidious (No cookies needed for YouTube)
     if is_yt(url):
         try:
-            return await download_invidious(uid, url, msg, quality, video_info)
+            return await download_invidious(uid, url, msg, quality)
         except Exception as e:
             if "CANCELLED" in str(e):
                 raise
@@ -595,15 +602,20 @@ async def download_video(uid: int, url: str, msg, quality: str = "720"):
             raise
         errors_list.append(f"Cobalt: {str(e)[:40]}")
     
-    # Method 3: yt-dlp
+    # Method 3: yt-dlp (needs cookies for some videos)
     try:
-        return await download_ytdlp(uid, url, msg, quality, video_info)
+        return await download_ytdlp(uid, url, msg, quality)
     except Exception as e:
         if "CANCELLED" in str(e):
             raise
         errors_list.append(f"yt-dlp: {str(e)[:40]}")
     
-    raise Exception("Download failed:\n" + "\n".join(errors_list))
+    # All failed
+    error_msg = "Download failed:\n" + "\n".join(errors_list)
+    if "Sign in" in str(errors_list) or "confirm" in str(errors_list):
+        error_msg += "\n\n💡 This video requires cookies. Ask admin to add cookies.txt"
+    
+    raise Exception(error_msg)
 
 async def download_direct(uid: int, url: str, msg):
     return await download_from_url(uid, url, msg, None, "720")
@@ -694,38 +706,52 @@ app = Client(
 )
 
 # =======================
+# VERIFICATION HANDLER
+# =======================
+async def send_verification(message, uid):
+    question, answer = generate_captcha()
+    user = user_get(uid)
+    user["verify_answer"] = answer
+    db_save()
+    
+    kb = generate_verify_keyboard(answer)
+    
+    await message.reply_text(
+        f"🤖 **Human Verification Required**\n\n"
+        f"Please solve this to continue:\n\n"
+        f"**{question} = ?**\n\n"
+        f"Select the correct answer below:",
+        reply_markup=kb
+    )
+
+# =======================
 # HANDLERS
 # =======================
 @app.on_message(filters.command("start") & filters.private)
 async def cmd_start(_, m):
     uid = m.from_user.id
-    user = user_get(uid)
+    user_get(uid)
     db_save()
     
-    if user.get("is_banned"):
-        return await m.reply_text("🚫 You are banned from using this bot.")
-    
-    if not await is_subscribed(uid):
-        return await m.reply_text(
-            "⚠️ **You must join our channel to use this bot!**\n\n"
-            "1️⃣ Click 'Join Channel' button below\n"
-            "2️⃣ Join the channel\n"
-            "3️⃣ Come back and click 'Verify'\n\n"
-            "This helps us keep the bot running! 🙏",
-            reply_markup=join_kb()
-        )
+    if not is_verified(uid):
+        return await send_verification(m, uid)
     
     await m.reply_text(
         f"👋 Hi **{m.from_user.first_name}**!\n\n"
-        f"🚀 Send any video link to download:\n"
-        f"• YouTube\n"
-        f"• Instagram\n"
-        f"• Direct links\n\n"
-        f"Just paste a link and I'll handle the rest!",
+        f"🚀 Send any video link (YouTube, Instagram, etc.)",
         reply_markup=menu_kb(uid)
     )
 
-@app.on_message(filters.text & filters.private & ~filters.command(["start"]))
+@app.on_message(filters.command("verify") & filters.private)
+async def cmd_verify(_, m):
+    uid = m.from_user.id
+    
+    if is_verified(uid):
+        return await m.reply_text("✅ You are already verified!", reply_markup=menu_kb(uid))
+    
+    await send_verification(m, uid)
+
+@app.on_message(filters.text & filters.private & ~filters.command(["start", "verify"]))
 async def on_text(_, m):
     uid = m.from_user.id
     user = user_get(uid)
@@ -734,14 +760,9 @@ async def on_text(_, m):
     if user.get("is_banned"):
         return
     
-    if not await is_subscribed(uid):
-        return await m.reply_text(
-            "⚠️ **You must join our channel first!**\n\n"
-            "Click 'Join Channel' and then 'Verify'",
-            reply_markup=join_kb()
-        )
+    if not is_verified(uid):
+        return await send_verification(m, uid)
     
-    # Handle states
     if user.get("state") == "rename":
         sess = session_get(uid)
         if not sess:
@@ -767,9 +788,9 @@ async def on_text(_, m):
         try:
             user_get(int(text))["is_pro"] = True
             db_save()
-            return await m.reply_text("✅ PRO added!", reply_markup=admin_kb())
+            return await m.reply_text("✅ PRO!", reply_markup=admin_kb())
         except:
-            return await m.reply_text("❌ Invalid ID!", reply_markup=admin_kb())
+            return await m.reply_text("❌ Invalid!", reply_markup=admin_kb())
     
     if user.get("state") == "ban" and uid == OWNER_ID:
         user["state"] = "none"
@@ -779,7 +800,7 @@ async def on_text(_, m):
             db_save()
             return await m.reply_text("✅ Banned!", reply_markup=admin_kb())
         except:
-            return await m.reply_text("❌ Invalid ID!", reply_markup=admin_kb())
+            return await m.reply_text("❌ Invalid!", reply_markup=admin_kb())
     
     if user.get("state") == "unban" and uid == OWNER_ID:
         user["state"] = "none"
@@ -789,29 +810,27 @@ async def on_text(_, m):
             db_save()
             return await m.reply_text("✅ Unbanned!", reply_markup=admin_kb())
         except:
-            return await m.reply_text("❌ Invalid ID!", reply_markup=admin_kb())
+            return await m.reply_text("❌ Invalid!", reply_markup=admin_kb())
+    
+    if user.get("state") == "resetverify" and uid == OWNER_ID:
+        user["state"] = "none"
+        db_save()
+        try:
+            target_user = user_get(int(text))
+            target_user["verified"] = False
+            db_save()
+            return await m.reply_text(f"✅ Reset!", reply_markup=admin_kb())
+        except:
+            return await m.reply_text("❌ Invalid!", reply_markup=admin_kb())
     
     if not text.startswith("http"):
         return
     
-    status = await m.reply_text("🔍 **Analyzing link...**", reply_markup=cancel_kb())
-    session_set(uid, {"url": text, "cancel": False})
+    if not await is_subscribed(uid):
+        return await m.reply_text("⚠️ **Join channel first!**", reply_markup=join_kb())
     
-    # For YouTube links, try to get video info first
-    if is_yt(text) and YOUTUBE_API_KEY:
-        video_id = extract_video_id(text)
-        if video_id:
-            video_info = await get_youtube_video_info(video_id)
-            if video_info:
-                await safe_edit(status,
-                    f"🎬 **YouTube Video Found**\n\n"
-                    f"📺 **{video_info['title'][:50]}**\n"
-                    f"👤 {video_info['channel']}\n"
-                    f"⏱️ {video_info['duration_str']} • 👁️ {video_info['views']:,} views\n\n"
-                    f"Choose quality:",
-                    yt_kb()
-                )
-                return
+    status = await m.reply_text("🔍 **Analyzing...**", reply_markup=cancel_kb())
+    session_set(uid, {"url": text, "cancel": False})
     
     if is_yt(text) or is_instagram(text):
         platform = "🎬 YouTube" if is_yt(text) else "📸 Instagram"
@@ -839,9 +858,10 @@ async def on_file(_, m):
     
     if user.get("is_banned"):
         return
-    
+    if not is_verified(uid):
+        return await send_verification(m, uid)
     if not await is_subscribed(uid):
-        return await m.reply_text("⚠️ **Join channel first!**", reply_markup=join_kb())
+        return await m.reply_text("⚠️ Join!", reply_markup=join_kb())
     
     media = m.video or m.document or m.audio
     status = await m.reply_text("⬇️ **Downloading...**", reply_markup=cancel_kb())
@@ -865,9 +885,8 @@ async def on_photo(_, m):
     
     if user.get("is_banned"):
         return
-    
-    if not await is_subscribed(uid):
-        return await m.reply_text("⚠️ **Join channel first!**", reply_markup=join_kb())
+    if not is_verified(uid):
+        return await send_verification(m, uid)
     
     path = os.path.join(THUMB_DIR, f"{uid}.jpg")
     await m.download(path)
@@ -887,28 +906,50 @@ async def on_cb(_, cb):
     if user.get("is_banned"):
         return
     
-    # VERIFY JOIN - Simple button to check subscription
-    if data == "verify_join":
-        if await is_subscribed(uid):
-            await cb.answer("✅ Verified! Welcome!", show_alert=True)
+    if data.startswith("verify_"):
+        if data == "verify_new":
+            question, answer = generate_captcha()
+            user["verify_answer"] = answer
+            db_save()
+            kb = generate_verify_keyboard(answer)
             return await safe_edit(cb.message,
-                f"✅ **Verification Successful!**\n\n"
-                f"Welcome **{cb.from_user.first_name}**! 🎉\n\n"
-                f"🚀 Send any video link to download:\n"
-                f"• YouTube\n"
-                f"• Instagram\n"
-                f"• Direct links",
+                f"🤖 **Human Verification Required**\n\n"
+                f"Please solve this to continue:\n\n"
+                f"**{question} = ?**\n\n"
+                f"Select the correct answer below:",
+                kb
+            )
+        
+        selected = int(data.replace("verify_", ""))
+        correct = user.get("verify_answer")
+        
+        if selected == correct:
+            user["verified"] = True
+            user["verify_answer"] = None
+            db_save()
+            await cb.answer("✅ Verification successful!", show_alert=True)
+            return await safe_edit(cb.message,
+                f"✅ **Verified Successfully!**\n\n"
+                f"Welcome **{cb.from_user.first_name}**!\n\n"
+                f"🚀 Send any video link to download.",
                 menu_kb(uid)
             )
         else:
-            await cb.answer("❌ You haven't joined the channel yet!\n\nPlease join first, then click Verify again.", show_alert=True)
-            return
+            await cb.answer("❌ Wrong answer! Try again.", show_alert=True)
+            question, answer = generate_captcha()
+            user["verify_answer"] = answer
+            db_save()
+            kb = generate_verify_keyboard(answer)
+            return await safe_edit(cb.message,
+                f"❌ **Wrong Answer!**\n\n"
+                f"Try again:\n\n"
+                f"**{question} = ?**",
+                kb
+            )
     
-    # Check subscription for all other actions
-    if data not in ["close"]:
-        if not await is_subscribed(uid):
-            await cb.answer("⚠️ Join channel first!", show_alert=True)
-            return await safe_edit(cb.message, "⚠️ **Join channel first!**", join_kb())
+    if not is_verified(uid) and data != "close":
+        await cb.answer("⚠️ Please verify first!", show_alert=True)
+        return await send_verification(cb.message, uid)
     
     if data == "close":
         try:
@@ -916,6 +957,11 @@ async def on_cb(_, cb):
         except:
             pass
         return
+    
+    if data == "check_join":
+        if await is_subscribed(uid):
+            return await safe_edit(cb.message, "✅ Verified!", menu_kb(uid))
+        return await cb.answer("❌ Not joined!", show_alert=True)
     
     if data == "cancel":
         if sess:
@@ -941,10 +987,11 @@ async def on_cb(_, cb):
     
     if data == "menu_stats":
         if uid == OWNER_ID:
+            verified_count = sum(1 for u in DB["users"].values() if u.get("verified"))
             return await safe_edit(cb.message,
                 f"📊 **Bot Stats**\n\n"
                 f"👥 Total Users: {len(DB['users'])}\n"
-                f"🔑 YouTube API: {'✅ Active' if YOUTUBE_API_KEY else '❌ Not set'}",
+                f"✅ Verified: {verified_count}",
                 menu_kb(uid))
         used = user.get("used", 0)
         return await safe_edit(cb.message, f"📊 Used today: {human_size(used)}", menu_kb(uid))
@@ -952,11 +999,10 @@ async def on_cb(_, cb):
     if data == "menu_help":
         return await safe_edit(cb.message,
             "❓ **How to use:**\n\n"
-            "1. Send a video link (YouTube, Instagram, etc.)\n"
+            "1. Send YouTube/Instagram link\n"
             "2. Choose quality\n"
             "3. Wait for download\n"
-            "4. Upload as file or video\n\n"
-            "📸 Send a photo to set custom thumbnail!",
+            "4. Upload as file or video",
             menu_kb(uid))
     
     if data == "thumb_view":
@@ -973,25 +1019,25 @@ async def on_cb(_, cb):
             os.remove(t)
         user["thumb"] = None
         db_save()
-        return await safe_edit(cb.message, "✅ Thumbnail deleted!", thumb_kb())
+        return await safe_edit(cb.message, "✅ Deleted!", thumb_kb())
     
-    # Admin
     if data == "admin":
         if uid != OWNER_ID:
             return
-        return await safe_edit(cb.message, "⚙️ **Admin Panel**", admin_kb())
+        return await safe_edit(cb.message, "⚙️ Admin Panel", admin_kb())
     
     if data == "adm_stats":
         if uid != OWNER_ID:
             return
+        verified_count = sum(1 for u in DB["users"].values() if u.get("verified"))
         banned_count = sum(1 for u in DB["users"].values() if u.get("is_banned"))
         pro_count = sum(1 for u in DB["users"].values() if u.get("is_pro"))
         return await safe_edit(cb.message,
             f"📊 **Statistics**\n\n"
             f"👥 Total users: {len(DB['users'])}\n"
+            f"✅ Verified: {verified_count}\n"
             f"👑 PRO: {pro_count}\n"
-            f"🚫 Banned: {banned_count}\n"
-            f"🔑 YouTube API: {'✅' if YOUTUBE_API_KEY else '❌'}",
+            f"🚫 Banned: {banned_count}",
             admin_kb())
     
     if data == "adm_bc":
@@ -1031,26 +1077,32 @@ async def on_cb(_, cb):
             return
         user["state"] = "addpro"
         db_save()
-        return await safe_edit(cb.message, "👑 Send user ID to add PRO:", cancel_kb())
+        return await safe_edit(cb.message, "👑 Send user ID:", cancel_kb())
     
     if data == "adm_ban":
         if uid != OWNER_ID:
             return
         user["state"] = "ban"
         db_save()
-        return await safe_edit(cb.message, "🚫 Send user ID to ban:", cancel_kb())
+        return await safe_edit(cb.message, "🚫 Send user ID:", cancel_kb())
     
     if data == "adm_unban":
         if uid != OWNER_ID:
             return
         user["state"] = "unban"
         db_save()
-        return await safe_edit(cb.message, "✅ Send user ID to unban:", cancel_kb())
+        return await safe_edit(cb.message, "✅ Send user ID:", cancel_kb())
     
-    # YouTube quality selection
+    if data == "adm_resetverify":
+        if uid != OWNER_ID:
+            return
+        user["state"] = "resetverify"
+        db_save()
+        return await safe_edit(cb.message, "🔓 Send user ID:", cancel_kb())
+    
     if data.startswith("yt_"):
         if not sess or not sess.get("url"):
-            return await safe_edit(cb.message, "❌ Session expired! Send the link again.", None)
+            return await safe_edit(cb.message, "❌ Session expired!", None)
         
         quality = data.replace("yt_", "")
         quality_display = quality.upper()
@@ -1076,7 +1128,6 @@ async def on_cb(_, cb):
                 await safe_edit(cb.message, f"❌ **Failed**\n\n{str(e)[:200]}", None)
         return
     
-    # Rename
     if data == "rename":
         if sess:
             return await safe_edit(cb.message, f"✏️ Current: `{sess['name']}`", rename_kb())
@@ -1089,17 +1140,16 @@ async def on_cb(_, cb):
         if sess:
             user["state"] = "rename"
             db_save()
-            return await safe_edit(cb.message, "✏️ Send new filename (without extension):", cancel_kb())
+            return await safe_edit(cb.message, "✏️ Send new filename:", cancel_kb())
     
     if data == "back_up":
         if sess:
             return await safe_edit(cb.message, f"📄 `{sess['name']}`\n📦 {human_size(sess.get('size', 0))}", upload_kb())
     
-    # Upload
     if data in ["up_file", "up_video"]:
         if not sess or not sess.get("path") or not os.path.exists(sess["path"]):
             session_clear(uid)
-            return await safe_edit(cb.message, "❌ File not found! Try again.", None)
+            return await safe_edit(cb.message, "❌ File not found!", None)
         
         try:
             await safe_edit(cb.message, "📤 **Uploading...**", cancel_kb())
@@ -1126,12 +1176,13 @@ async def main():
     os.makedirs(DOWNLOAD_DIR, exist_ok=True)
     os.makedirs(THUMB_DIR, exist_ok=True)
     db_load()
+    find_cookies()
     
     await app.start()
     print("=" * 60)
     print("✅ BOT STARTED SUCCESSFULLY!")
     print(f"👥 Users: {len(DB['users'])}")
-    print(f"🔑 YouTube API: {'Active' if YOUTUBE_API_KEY else 'Not configured'}")
+    print(f"🍪 Cookies: {'Found' if COOKIES_PATH else 'Not found'}")
     print("=" * 60)
     
     srv = web.Application()
