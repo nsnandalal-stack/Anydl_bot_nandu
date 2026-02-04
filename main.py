@@ -210,8 +210,8 @@ async def is_subscribed(uid: int) -> bool:
 # =======================
 def join_kb():
     return types.InlineKeyboardMarkup([
-        [types.InlineKeyboardButton( Join Channel, url=INVITE_LINK)],
-        [types.InlineKeyboardButton(✅ I've Joined, callback_data=check_join)]
+       [types.InlineKeyboardButton("📢 Join Channel", url=INVITE_LINK)],
+       [types.InlineKeyboardButton(✅ I've Joined, callback_data=check_join)]
     ])
 
 def cancel_kb():
